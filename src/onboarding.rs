@@ -686,9 +686,79 @@ pub enum Event {
     Exited,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinuxReadiness {
+    pub x11_session: bool,
+    pub audio_input: bool,
+    pub ffmpeg_installed: bool,
+    pub parakeet_ready: bool,
+}
+
+impl LinuxReadiness {
+    pub fn to_grants(&self) -> Grants {
+        let mut statuses = BTreeMap::new();
+        let screen = if self.x11_session && self.ffmpeg_installed {
+            Status::Granted
+        } else {
+            Status::NotDetermined
+        };
+        statuses.insert(Permission::ScreenRecording, screen);
+
+        let mic = if self.audio_input && self.parakeet_ready {
+            Status::Granted
+        } else {
+            Status::NotDetermined
+        };
+        statuses.insert(Permission::Microphone, mic);
+
+        let a11y = if self.x11_session {
+            Status::Granted
+        } else {
+            Status::NotDetermined
+        };
+        statuses.insert(Permission::Accessibility, a11y);
+
+        let camera = if self.x11_session {
+            Status::Granted
+        } else {
+            Status::NotDetermined
+        };
+        statuses.insert(Permission::Camera, camera);
+
+        Grants {
+            statuses,
+            screen_needs_relaunch: false,
+        }
+    }
+}
+
+pub fn check_linux_readiness() -> LinuxReadiness {
+    let x11_session = std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty());
+    let audio_input = cpal::traits::HostTrait::default_input_device(&cpal::default_host()).is_some();
+    let ffmpeg_installed = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    let parakeet_ready = crate::parakeet::is_model_ready_in(&crate::parakeet::model_dir());
+    LinuxReadiness {
+        x11_session,
+        audio_input,
+        ffmpeg_installed,
+        parakeet_ready,
+    }
+}
+
 /// Reads what's granted now from a fresh helper, plus whether this process can use a Screen
 /// Recording grant yet. Only once the helper says it's granted does this process try a real
 /// ScreenCaptureKit capture (`capture::screen_capture_usable`), so no prompt can come of it.
+#[cfg(target_os = "linux")]
+pub fn read_grants() -> Option<Grants> {
+    Some(check_linux_readiness().to_grants())
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn read_grants() -> Option<Grants> {
     let statuses = crate::helper::permissions()
         .inspect_err(|error| crate::capture::scrawl_log(format!("permissions: {error:#}")))
@@ -794,6 +864,12 @@ impl Session {
     /// Feeds the flow and carries out what the window can do itself. Returns what needs the
     /// app: `Close` or `Relaunch`.
     pub fn input(&mut self, input: Input) -> Effect {
+        #[cfg(target_os = "linux")]
+        if matches!(input, Input::Grant(Permission::Microphone)) {
+            std::thread::spawn(|| {
+                let _ = crate::parakeet::ensure_parakeet_model(&mut |_, _| {});
+            });
+        }
         let effect = self.flow.on(input);
         crate::capture::scrawl_log(format!("onboarding: {:?} -> {effect:?}", self.flow.step()));
         let result = match effect {
@@ -803,10 +879,22 @@ impl Session {
                 Effect::None
             }
             Effect::Request(permission) => {
+                #[cfg(target_os = "linux")]
+                if permission == Permission::Microphone {
+                    std::thread::spawn(|| {
+                        let _ = crate::parakeet::ensure_parakeet_model(&mut |_, _| {});
+                    });
+                }
                 self.send(&serde_json::json!({"type": "request", "permission": permission}));
                 Effect::None
             }
             Effect::OpenSettings(permission) => {
+                #[cfg(target_os = "linux")]
+                if permission == Permission::Microphone {
+                    std::thread::spawn(|| {
+                        let _ = crate::parakeet::ensure_parakeet_model(&mut |_, _| {});
+                    });
+                }
                 self.send(&serde_json::json!({"type": "open-settings", "permission": permission}));
                 Effect::None
             }
@@ -903,24 +991,36 @@ pub fn relaunch() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let bundle = exe
-        .ancestors()
-        .find(|p| p.extension().is_some_and(|ext| ext == "app"));
     let pid = std::process::id().to_string();
     let mut command = std::process::Command::new("/bin/sh");
-    match bundle {
-        Some(app) => command
-            .arg("-c")
-            .arg(format!("{AFTER_EXIT}exec /usr/bin/open \"$1\""))
-            .args(["scrawl-relaunch", &pid])
-            .arg(app),
-        None => command
+    #[cfg(target_os = "macos")]
+    {
+        let bundle = exe
+            .ancestors()
+            .find(|p| p.extension().is_some_and(|ext| ext == "app"));
+        match bundle {
+            Some(app) => command
+                .arg("-c")
+                .arg(format!("{AFTER_EXIT}exec /usr/bin/open \"$1\""))
+                .args(["scrawl-relaunch", &pid])
+                .arg(app),
+            None => command
+                .arg("-c")
+                .arg(format!("{AFTER_EXIT}exec \"$@\""))
+                .args(["scrawl-relaunch", &pid])
+                .arg(&exe)
+                .args(std::env::args_os().skip(1)),
+        };
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        command
             .arg("-c")
             .arg(format!("{AFTER_EXIT}exec \"$@\""))
             .args(["scrawl-relaunch", &pid])
             .arg(&exe)
-            .args(std::env::args_os().skip(1)),
-    };
+            .args(std::env::args_os().skip(1));
+    }
     let _ = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1394,5 +1494,25 @@ mod tests {
         assert!(g.granted(ScreenRecording));
         assert_eq!(g.status(Microphone), Status::Denied);
         assert_eq!(g.status(Accessibility), Status::NotDetermined);
+    }
+
+    #[test]
+    fn linux_readiness_maps_to_onboarding_grants() {
+        let mut r = LinuxReadiness {
+            x11_session: true,
+            audio_input: true,
+            ffmpeg_installed: true,
+            parakeet_ready: false,
+        };
+        let g = r.to_grants();
+        assert!(g.granted(Permission::ScreenRecording));
+        assert!(
+            !g.granted(Permission::Microphone),
+            "Microphone row stays ungranted until Parakeet model is ready"
+        );
+        assert!(g.granted(Permission::Accessibility));
+
+        r.parakeet_ready = true;
+        assert!(r.to_grants().granted(Permission::Microphone));
     }
 }

@@ -398,6 +398,7 @@ pub enum LoginItem {
     Unavailable,
 }
 
+#[cfg(target_os = "macos")]
 fn main_app_service() -> Option<objc2::rc::Retained<objc2::runtime::AnyObject>> {
     use objc2::runtime::{AnyClass, AnyObject};
     let class = AnyClass::get(c"SMAppService")?;
@@ -411,6 +412,7 @@ fn main_app_service() -> Option<objc2::rc::Retained<objc2::runtime::AnyObject>> 
     }
 }
 
+#[cfg(target_os = "macos")]
 pub fn login_item() -> LoginItem {
     let Some(service) = main_app_service() else {
         return LoginItem::Unavailable;
@@ -424,6 +426,7 @@ pub fn login_item() -> LoginItem {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub fn set_login_item(on: bool) -> anyhow::Result<()> {
     use objc2::runtime::Bool;
     use objc2_foundation::NSError;
@@ -450,11 +453,67 @@ pub fn set_login_item(on: bool) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn open_login_items_settings() {
     use objc2::runtime::AnyClass;
     if let Some(class) = AnyClass::get(c"SMAppService") {
         let _: () = unsafe { objc2::msg_send![class, openSystemSettingsLoginItems] };
     }
+}
+
+#[cfg(target_os = "linux")]
+fn autostart_desktop_path() -> Option<PathBuf> {
+    let config_dir = dirs::config_dir().or_else(|| {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
+    })?;
+    Some(config_dir.join("autostart").join("scrawl.desktop"))
+}
+
+#[cfg(target_os = "linux")]
+pub fn login_item() -> LoginItem {
+    let Some(path) = autostart_desktop_path() else {
+        return LoginItem::Unavailable;
+    };
+    if path.is_file() {
+        LoginItem::On
+    } else {
+        LoginItem::Off
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn set_login_item(on: bool) -> anyhow::Result<()> {
+    let Some(path) = autostart_desktop_path() else {
+        anyhow::bail!("Cannot determine autostart directory");
+    };
+    if on {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let exe = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "scrawl".into());
+        let content = format!(
+            "[Desktop Entry]\nType=Application\nName=Scrawl\nComment=Shortcut-triggered screen, voice, and drawing capture for agents\nExec={exe}\nIcon=scrawl\nTerminal=false\nCategories=Utility;\n"
+        );
+        std::fs::write(&path, content)?;
+    } else if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_login_items_settings() {}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn login_item() -> LoginItem {
+    LoginItem::Unavailable
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn set_login_item(_on: bool) -> anyhow::Result<()> {
+    Ok(())
 }
 
 // MARK: What the window shows
@@ -1099,10 +1158,22 @@ impl Session {
                 Effect::None
             }
             Effect::Request(permission) => {
+                #[cfg(target_os = "linux")]
+                if permission == Permission::Microphone {
+                    std::thread::spawn(|| {
+                        let _ = crate::parakeet::ensure_parakeet_model(&mut |_, _| {});
+                    });
+                }
                 self.send(&serde_json::json!({"type": "request", "permission": permission}));
                 Effect::None
             }
             Effect::OpenSettings(permission) => {
+                #[cfg(target_os = "linux")]
+                if permission == Permission::Microphone {
+                    std::thread::spawn(|| {
+                        let _ = crate::parakeet::ensure_parakeet_model(&mut |_, _| {});
+                    });
+                }
                 self.send(&serde_json::json!({"type": "open-settings", "permission": permission}));
                 Effect::None
             }
@@ -1113,7 +1184,12 @@ impl Session {
             Effect::ShowCaptures => {
                 let dir = crate::handoff::default_captures_dir();
                 let _ = std::fs::create_dir_all(&dir);
+                #[cfg(target_os = "macos")]
                 let _ = std::process::Command::new("/usr/bin/open").arg(dir).spawn();
+                #[cfg(target_os = "linux")]
+                let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                let _ = std::process::Command::new("open").arg(dir).spawn();
                 Effect::None
             }
             Effect::CheckForUpdates => {

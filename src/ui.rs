@@ -10,17 +10,26 @@ use gpui::{
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, img, point,
     prelude::*, px, relative, rgb, rgba, size, svg,
 };
-use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObjectProtocol};
-use objc2::{AnyThread, DefinedClass, MainThreadOnly, msg_send, sel};
-use objc2_app_kit::{
-    NSApplication, NSCellImagePosition, NSColor, NSImage, NSMenu, NSMenuDelegate, NSMenuItem,
-    NSStatusBar, NSStatusItem, NSStatusWindowLevel, NSWindow, NSWindowButton,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+#[cfg(target_os = "macos")]
+use {
+    objc2::rc::Retained,
+    objc2::runtime::{AnyObject, NSObjectProtocol},
+    objc2::{AnyThread, DefinedClass, MainThreadOnly, msg_send, sel},
+    objc2_app_kit::{
+        NSApplication, NSCellImagePosition, NSColor, NSImage, NSMenu, NSMenuDelegate, NSMenuItem,
+        NSStatusBar, NSStatusItem, NSStatusWindowLevel, NSWindow, NSWindowButton,
+        NSWindowCollectionBehavior, NSWindowStyleMask,
+    },
+    objc2_foundation::{MainThreadMarker, NSData, NSObject, NSSize, NSString},
+    screencapturekit::prelude::*,
+    screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager},
 };
-use objc2_foundation::{MainThreadMarker, NSData, NSObject, NSSize, NSString};
-use screencapturekit::prelude::*;
-use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
+
+#[cfg(target_os = "linux")]
+use {
+    muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    tray_icon::{Icon, TrayIconBuilder},
+};
 
 use crate::audio::AudioRecorder;
 use crate::capture::{
@@ -359,6 +368,7 @@ fn uncover_alpha(outer: f32, x: f32, w: f32) -> f32 {
 }
 
 /// Whether macOS asks for reduced motion (Accessibility ▸ Display ▸ Reduce motion).
+#[cfg(target_os = "macos")]
 fn reduce_motion() -> bool {
     use objc2::runtime::AnyClass;
     let Some(cls) = AnyClass::get(c"NSWorkspace") else {
@@ -368,6 +378,11 @@ fn reduce_motion() -> bool {
         let workspace: *mut AnyObject = msg_send![cls, sharedWorkspace];
         !workspace.is_null() && msg_send![workspace, accessibilityDisplayShouldReduceMotion]
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reduce_motion() -> bool {
+    false
 }
 
 /// Intrinsic outer width of the capsule for a phase, mirroring the layout in `HudPillWindow`.
@@ -446,10 +461,12 @@ enum MenuAction {
     Quit,
 }
 
+#[cfg(target_os = "macos")]
 struct MenuTargetIvars {
     sender: flume::Sender<MenuAction>,
 }
 
+#[cfg(target_os = "macos")]
 objc2::define_class!(
     #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
@@ -520,10 +537,13 @@ objc2::define_class!(
     }
 );
 
+#[cfg(target_os = "macos")]
 /// Tag on the status menu's inbox rows, so each open can replace them.
 const INBOX_MENU_TAG: isize = 0x5c4a;
+#[cfg(target_os = "macos")]
 /// Tag on **Export Last Capture as Video…**, shown only with `"videoExport": true`.
 const EXPORT_VIDEO_MENU_TAG: isize = 0x5c4e;
+#[cfg(target_os = "macos")]
 /// Tag on **Record Screen**, whose title carries the record shortcut.
 const RECORD_MENU_TAG: isize = 0x5c4d;
 
@@ -535,6 +555,7 @@ fn record_menu_title() -> String {
     )
 }
 
+#[cfg(target_os = "macos")]
 /// Lists unhandled iPhone captures at the top of the status menu, read fresh from disk so the
 /// ages are current.
 fn rebuild_inbox_menu_items(menu: &NSMenu, target: &ScrawlMenuTarget) {
@@ -604,6 +625,7 @@ fn rebuild_inbox_menu_items(menu: &NSMenu, target: &ScrawlMenuTarget) {
 static EXPORT_STATUS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static EXPORTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(target_os = "macos")]
 fn set_status_text(text: &str) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
@@ -617,6 +639,9 @@ fn set_status_text(text: &str) {
         button.setTitle(&NSString::from_str(text));
     });
 }
+
+#[cfg(not(target_os = "macos"))]
+fn set_status_text(_text: &str) {}
 
 /// Exports the newest bundle to `~/Movies/Scrawl/<name>.mp4` off the main thread, reporting
 /// through `EXPORT_STATUS`, then reveals the file in Finder.
@@ -649,8 +674,17 @@ fn start_video_export() {
                 Ok(exported) => {
                     scrawl_log(format!("Exported {}", crate::export::describe(&exported)));
                     say(Some("Exported".into()));
+                    #[cfg(target_os = "macos")]
                     let _ = std::process::Command::new("/usr/bin/open")
                         .arg("-R")
+                        .arg(&exported.path)
+                        .spawn();
+                    #[cfg(target_os = "linux")]
+                    let _ = std::process::Command::new("xdg-open")
+                        .arg(exported.path.parent().unwrap_or(&exported.path))
+                        .spawn();
+                    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                    let _ = std::process::Command::new("open")
                         .arg(&exported.path)
                         .spawn();
                 }
@@ -669,6 +703,7 @@ fn start_video_export() {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// Shows the unhandled iPhone capture count beside the menu bar icon.
 fn set_status_inbox_count(count: usize) {
     let Some(mtm) = MainThreadMarker::new() else {
@@ -692,6 +727,10 @@ fn set_status_inbox_count(count: usize) {
     });
 }
 
+#[cfg(not(target_os = "macos"))]
+fn set_status_inbox_count(_count: usize) {}
+
+#[cfg(target_os = "macos")]
 impl ScrawlMenuTarget {
     fn new(sender: flume::Sender<MenuAction>, mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(MenuTargetIvars { sender });
@@ -699,16 +738,19 @@ impl ScrawlMenuTarget {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct StatusBarController {
     _item: Retained<NSStatusItem>,
     _menu: Retained<NSMenu>,
     _target: Retained<ScrawlMenuTarget>,
 }
 
+#[cfg(target_os = "macos")]
 thread_local! {
     static STATUS_BAR: RefCell<Option<StatusBarController>> = const { RefCell::new(None) };
 }
 
+#[cfg(target_os = "macos")]
 fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     let mtm = MainThreadMarker::new()?;
     let (sender, receiver) = flume::bounded(16);
@@ -784,6 +826,91 @@ fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     Some(receiver)
 }
 
+#[cfg(target_os = "linux")]
+fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
+    let (sender, receiver) = flume::bounded(16);
+
+    let menu = Menu::new();
+    let record_item = MenuItem::with_id("toggle_capture", &record_menu_title(), true, None);
+    let choose_target_item =
+        MenuItem::with_id("choose_target", "Choose What to Record…", true, None);
+    let sep1 = PredefinedMenuItem::separator();
+    let open_latest_item = MenuItem::with_id("open_latest", "Open Latest Capture", true, None);
+    let export_video_item =
+        MenuItem::with_id("export_video", "Export Last Capture as Video…", true, None);
+    let sep2 = PredefinedMenuItem::separator();
+    let settings_item = MenuItem::with_id("settings", "Settings…", true, None);
+    let check_updates_item =
+        MenuItem::with_id("check_for_updates", "Check for Updates…", true, None);
+    let quit_item = MenuItem::with_id("quit", "Quit Scrawl", true, None);
+
+    let _ = menu.append(&record_item);
+    let _ = menu.append(&choose_target_item);
+    let _ = menu.append(&sep1);
+    let _ = menu.append(&open_latest_item);
+    if crate::handoff::video_export() {
+        let _ = menu.append(&export_video_item);
+    }
+    let _ = menu.append(&sep2);
+    let _ = menu.append(&settings_item);
+    let _ = menu.append(&check_updates_item);
+    let _ = menu.append(&quit_item);
+
+    let png_bytes = include_bytes!("../assets/menubar-icon@2x.png");
+    let icon = if let Ok(dyn_img) =
+        image::load_from_memory_with_format(png_bytes, image::ImageFormat::Png)
+    {
+        let rgba = dyn_img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        Icon::from_rgba(rgba.into_raw(), width, height).ok()
+    } else {
+        None
+    };
+    let icon = icon.unwrap_or_else(|| {
+        let fallback = vec![255u8; 32 * 32 * 4];
+        Icon::from_rgba(fallback, 32, 32).expect("valid fallback icon")
+    });
+
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("Scrawl")
+        .with_icon(icon)
+        .build();
+
+    if let Ok(tray) = tray {
+        Box::leak(Box::new(tray));
+    }
+
+    let menu_channel = MenuEvent::receiver();
+    let tx = sender.clone();
+    std::thread::Builder::new()
+        .name("scrawl-tray-events".into())
+        .spawn(move || {
+            while let Ok(event) = menu_channel.recv() {
+                let action = match event.id.as_ref() {
+                    "toggle_capture" => MenuAction::ToggleCapture,
+                    "choose_target" => MenuAction::ChooseTarget,
+                    "open_latest" => MenuAction::OpenLatest,
+                    "export_video" => MenuAction::ExportVideo,
+                    "settings" => MenuAction::Settings,
+                    "check_for_updates" => MenuAction::CheckForUpdates,
+                    "quit" => MenuAction::Quit,
+                    _ => continue,
+                };
+                let _ = tx.try_send(action);
+            }
+        })
+        .ok();
+
+    Some(receiver)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
+    None
+}
+
+#[cfg(target_os = "macos")]
 fn find_hud_pill_ns_window() -> Option<Retained<NSWindow>> {
     let mtm = MainThreadMarker::new()?;
     let app = NSApplication::sharedApplication(mtm);
@@ -801,6 +928,7 @@ fn find_hud_pill_ns_window() -> Option<Retained<NSWindow>> {
 
 /// Whether the pointer is over the HUD pill's window: the capsule plus a small margin, so the
 /// switch chips stay while the user reaches for them.
+#[cfg(target_os = "macos")]
 fn pointer_on_hud_pill() -> bool {
     use objc2::runtime::AnyClass;
     use objc2_foundation::NSPoint;
@@ -815,6 +943,12 @@ fn pointer_on_hud_pill() -> bool {
         && p.y <= f.origin.y + f.size.height
 }
 
+#[cfg(not(target_os = "macos"))]
+fn pointer_on_hud_pill() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
 fn find_picker_ns_window() -> Option<Retained<NSWindow>> {
     let mtm = MainThreadMarker::new()?;
     let app = NSApplication::sharedApplication(mtm);
@@ -834,6 +968,7 @@ fn find_picker_ns_window() -> Option<Retained<NSWindow>> {
     None
 }
 
+#[cfg(target_os = "macos")]
 fn sync_full_size_content_view(ns_window: &NSWindow) {
     for kind in [
         NSWindowButton::CloseButton,
@@ -865,6 +1000,7 @@ fn sync_full_size_content_view(ns_window: &NSWindow) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool, level_offset: isize) {
     ns_window.setHidesOnDeactivate(false);
     ns_window.setIgnoresMouseEvents(ignores_mouse);
@@ -879,16 +1015,19 @@ fn configure_floating_window(ns_window: &NSWindow, ignores_mouse: bool, level_of
     sync_full_size_content_view(ns_window);
 }
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct OpaqueCGColor {
     _priv: [u8; 0],
 }
 
+#[cfg(target_os = "macos")]
 unsafe impl objc2::RefEncode for OpaqueCGColor {
     const ENCODING_REF: objc2::Encoding =
         objc2::Encoding::Pointer(&objc2::Encoding::Struct("CGColor", &[]));
 }
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CATransform3D {
@@ -910,6 +1049,7 @@ struct CATransform3D {
     m44: f64,
 }
 
+#[cfg(target_os = "macos")]
 unsafe impl objc2::Encode for CATransform3D {
     const ENCODING: objc2::Encoding = objc2::Encoding::Struct(
         "CATransform3D",
@@ -940,6 +1080,7 @@ unsafe impl objc2::Encode for CATransform3D {
 ///    silhouette are always 100% razor-sharp.
 /// 2. `contentView.layer()` (which renders only the inner chips/text on a transparent background)
 ///    receives `CAFilter("gaussianBlur")` + `CATransform3D` scale so only the inner contents blur.
+#[cfg(target_os = "macos")]
 fn apply_pill_layer_effect(
     ns_window: &NSWindow,
     shell_slot: &mut Option<Retained<objc2_quartz_core::CALayer>>,
@@ -1080,12 +1221,14 @@ fn apply_pill_layer_effect(
 }
 
 /// The content layer's scale: the capsule's, less a little per px of blur.
+#[cfg(target_os = "macos")]
 fn content_scale(scale: f32, blur_radius: f32, content_shrink: f32) -> f64 {
     let s = f64::from(scale.clamp(0.50, 1.15));
     (s * (1.0 - f64::from(blur_radius).min(5.0) * f64::from(content_shrink))).clamp(0.85, 1.06)
 }
 
 /// The pill window's frame in screen points with a top-left origin (the primary display's).
+#[cfg(target_os = "macos")]
 fn top_left_frame(ns_window: &NSWindow) -> [f32; 4] {
     let f = ns_window.frame();
     let primary_h = MainThreadMarker::new()
@@ -1101,6 +1244,7 @@ fn top_left_frame(ns_window: &NSWindow) -> [f32; 4] {
 
 /// One trace frame for the capsule (`SCRAWL_MOTION_TRACE`): its window, the shell as drawn, the
 /// content's blur and opacity. Returns the mapping for the content's children.
+#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn trace_capsule(
     ns_window: &NSWindow,
@@ -3495,7 +3639,9 @@ impl ScrawlCoordinator {
 pub struct HudPillWindow {
     coordinator: Entity<ScrawlCoordinator>,
     focus: FocusHandle,
+    #[cfg(target_os = "macos")]
     ns_window: Option<Retained<NSWindow>>,
+    #[cfg(target_os = "macos")]
     shell_layer: Option<Retained<objc2_quartz_core::CALayer>>,
     /// Frames drawn so far, counting to 2.
     frames: u8,
@@ -3503,6 +3649,7 @@ pub struct HudPillWindow {
 
 impl Render for HudPillWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(target_os = "macos")]
         if self.ns_window.is_none() {
             self.ns_window = find_hud_pill_ns_window();
         }
@@ -3681,6 +3828,7 @@ impl Render for HudPillWindow {
         let content_shrink = if swap.is_some() { 0.0 } else { 0.015 };
         let is_completed = matches!(target_phase, IslandPhase::Completed { .. });
 
+        #[cfg(target_os = "macos")]
         if let Some(ref ns_win) = self.ns_window {
             apply_pill_layer_effect(
                 ns_win,
@@ -3695,6 +3843,7 @@ impl Render for HudPillWindow {
                 content_shrink,
             );
         }
+        #[cfg(target_os = "macos")]
         let trace_xf = self.ns_window.as_ref().filter(|_| tracing).map(|ns_win| {
             trace_capsule(
                 ns_win,
@@ -3707,6 +3856,8 @@ impl Render for HudPillWindow {
                 content_shrink,
             )
         });
+        #[cfg(not(target_os = "macos"))]
+        let trace_xf: Option<motion::Xf> = None;
 
         let c_paste_down = self.coordinator.clone();
         let c_paste_up = self.coordinator.clone();
@@ -4083,7 +4234,10 @@ impl Render for HudPillWindow {
             IslandPhase::Hidden | IslandPhase::Dismissing => row,
         };
 
+        #[cfg(target_os = "macos")]
         let has_shell = self.shell_layer.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let has_shell = false;
         let c_keys = self.coordinator.clone();
         let pin_lead = matches!(content_phase, IslandPhase::Recording);
 
@@ -5145,7 +5299,16 @@ impl Render for BundleReviewWindow {
                             .child(
                                 action_button("btn-reveal", "Show in Finder", false).on_click(
                                     move |_, _, cx| {
+                                        #[cfg(target_os = "macos")]
                                         let _ = std::process::Command::new("/usr/bin/open")
+                                            .arg(&send_dir)
+                                            .spawn();
+                                        #[cfg(target_os = "linux")]
+                                        let _ = std::process::Command::new("xdg-open")
+                                            .arg(&send_dir)
+                                            .spawn();
+                                        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                                        let _ = std::process::Command::new("open")
                                             .arg(&send_dir)
                                             .spawn();
                                         c_send.update(cx, |coord, cx| {
@@ -5527,6 +5690,7 @@ fn display_at(frame: [f32; 4], cx: &App) -> Option<std::rc::Rc<dyn gpui::Platfor
 }
 
 /// Moves a window to cover the screen at `frame` (global points).
+#[cfg(target_os = "macos")]
 fn move_window_to_screen(ns_win: &NSWindow, frame: [f64; 4]) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
@@ -5574,9 +5738,12 @@ fn open_picker_windows(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
             is_resizable: false,
             is_minimizable: false,
             window_background: WindowBackgroundAppearance::Transparent,
+            #[cfg(target_os = "linux")]
+            app_id: Some("scrawl".into()),
             ..Default::default()
         },
         move |window, cx| {
+            #[cfg(target_os = "macos")]
             if let Some(ns_win) = find_picker_ns_window() {
                 ns_win.setStyleMask(
                     NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
@@ -5635,6 +5802,7 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
     for handle in cx.windows() {
         if let Some(pill) = handle.downcast::<HudPillWindow>() {
             let _ = pill.update(cx, |view, _, cx| {
+                #[cfg(target_os = "macos")]
                 if let Some(ref ns_win) = view.ns_window {
                     ns_win.setLevel(NSStatusWindowLevel + 3);
                     ns_win.orderFrontRegardless();
@@ -5688,11 +5856,16 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
             is_resizable: false,
             is_minimizable: false,
             window_background: WindowBackgroundAppearance::Transparent,
+            #[cfg(target_os = "linux")]
+            app_id: Some("scrawl".into()),
             ..Default::default()
         },
         move |window, cx| {
+            #[cfg(target_os = "macos")]
             let ns_window = find_hud_pill_ns_window();
+            #[cfg(target_os = "macos")]
             let mut shell_layer = None;
+            #[cfg(target_os = "macos")]
             if let Some(ref ns_win) = ns_window {
                 ns_win.setStyleMask(
                     NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
@@ -5736,7 +5909,9 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
                 HudPillWindow {
                     coordinator: pill_coord,
                     focus,
+                    #[cfg(target_os = "macos")]
                     ns_window,
+                    #[cfg(target_os = "macos")]
                     shell_layer,
                     frames: 0,
                 }
@@ -5765,10 +5940,12 @@ fn close_capture_windows(cx: &mut App) {
 
 /// The app that was in front when Scrawl activated itself for the picker or the review window
 /// (0: none).
+#[cfg(target_os = "macos")]
 static PREVIOUS_FRONT_APP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// Called just before Scrawl activates itself to take the keys. Scrawl in front already (one
 /// key window opening over another) keeps the app remembered first.
+#[cfg(target_os = "macos")]
 fn remember_front_app() {
     use objc2_app_kit::NSWorkspace;
     let front = NSWorkspace::sharedWorkspace()
@@ -5779,10 +5956,14 @@ fn remember_front_app() {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+fn remember_front_app() {}
+
 /// Run (deferred) after any window closes: once neither a picker nor a review window is left,
 /// the app that was in front before gets the keys back. `NSApp.deactivate()` isn't enough: a
 /// menu bar (accessory) app stays frontmost with no windows, and keys go nowhere. Deferred, a
 /// picker replacing another one is open again by the time this looks.
+#[cfg(target_os = "macos")]
 fn hand_back_keys(cx: &mut App) {
     use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
     if cx.windows().iter().any(|handle| {
@@ -5806,6 +5987,9 @@ fn hand_back_keys(cx: &mut App) {
         app.deactivate();
     }
 }
+
+#[cfg(not(target_os = "macos"))]
+fn hand_back_keys(_cx: &mut App) {}
 
 fn close_review_window(cx: &mut App) {
     for handle in cx.windows() {
@@ -5845,6 +6029,8 @@ fn open_review_window(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) {
             kind: WindowKind::Normal,
             is_resizable: true,
             window_background: WindowBackgroundAppearance::Opaque,
+            #[cfg(target_os = "linux")]
+            app_id: Some("scrawl".into()),
             ..Default::default()
         },
         move |window, cx| {
@@ -5925,6 +6111,7 @@ pub fn run_start_benchmark() {
 
 /// Keeps Scrawl a menu bar app with no Dock icon. Info.plist's `LSUIElement` starts it that way,
 /// but gpui 0.2.2 sets the regular activation policy once launched, so this runs after that.
+#[cfg(target_os = "macos")]
 fn stay_out_of_dock() {
     use objc2_app_kit::NSApplicationActivationPolicy;
     if let Some(mtm) = MainThreadMarker::new() {
@@ -5932,6 +6119,9 @@ fn stay_out_of_dock() {
             .setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     }
 }
+
+#[cfg(not(target_os = "macos"))]
+fn stay_out_of_dock() {}
 
 /// Runs the GPUI desktop app, optionally opening an initial `.scrawl` bundle in the Review window
 /// or starting recording immediately.
@@ -5987,6 +6177,7 @@ pub fn run_app(
                 cx.background_executor()
                     .timer(Duration::from_millis(650))
                     .await;
+                #[cfg(target_os = "macos")]
                 let window_num = cx
                     .update(|_| {
                         let mtm = MainThreadMarker::new()?;
@@ -6008,6 +6199,8 @@ pub fn run_app(
                     })
                     .ok()
                     .flatten();
+                #[cfg(not(target_os = "macos"))]
+                let window_num: Option<isize> = None;
                 let _ = cx
                     .background_executor()
                     .spawn(async move { capture_own_window_screenshot(window_num, &out_path) })
@@ -6167,6 +6360,7 @@ pub fn run_app(
     });
 }
 
+#[cfg(target_os = "macos")]
 fn capture_own_window_screenshot(
     window_num: Option<isize>,
     out_path: &std::path::Path,
@@ -6227,6 +6421,15 @@ fn capture_own_window_screenshot(
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
+fn capture_own_window_screenshot(
+    _window_num: Option<isize>,
+    _out_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn capture_cg_window_rgba(window_id: u32) -> Option<crate::model::RgbaFrame> {
     use core_graphics::geometry::{CGPoint, CGRect, CGSize};
     use std::ffi::c_void;
@@ -6448,6 +6651,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn reveal_appkit_queries_pass_objc2_verification() {
         let _ = reduce_motion();
         let cls = objc2::runtime::AnyClass::get(c"NSEvent").expect("NSEvent");
@@ -6593,6 +6797,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn ca_layer_and_filter_encodings_pass_objc2_verification() {
         use objc2::runtime::AnyClass;
         use objc2_foundation::{NSArray, NSNumber};

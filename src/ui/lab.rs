@@ -339,6 +339,7 @@ fn open_backdrop(display: [f32; 2], cx: &mut App) {
             is_resizable: false,
             is_minimizable: false,
             window_background: WindowBackgroundAppearance::Opaque,
+            app_id: Some("scrawl".into()),
             ..Default::default()
         },
         move |_, cx| cx.new(|_| Backdrop { theme }),
@@ -346,6 +347,7 @@ fn open_backdrop(display: [f32; 2], cx: &mut App) {
     if opened.is_err() {
         return;
     }
+    #[cfg(target_os = "macos")]
     if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
         for win in objc2_app_kit::NSApplication::sharedApplication(mtm).windows() {
             let f = win.frame().size;
