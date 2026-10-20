@@ -112,10 +112,12 @@ pub enum Browser {
     Chromium,
     /// Safari: `URL of current tab of front window`.
     Safari,
+    /// Firefox, Zen, etc.
+    Firefox,
 }
 
 pub fn browser_kind(bundle_id: &str) -> Option<Browser> {
-    const CHROMIUM: [&str; 6] = [
+    const CHROMIUM_MAC: [&str; 6] = [
         "com.google.chrome",
         "com.brave.browser",
         "company.thebrowser.browser",
@@ -123,15 +125,54 @@ pub fn browser_kind(bundle_id: &str) -> Option<Browser> {
         "com.vivaldi.vivaldi",
         "org.chromium.chromium",
     ];
-    let id = bundle_id.to_ascii_lowercase();
+    let id = bundle_id.trim().to_ascii_lowercase();
     if id == "com.apple.safari" || id == "com.apple.safaritechnologypreview" {
         return Some(Browser::Safari);
     }
     // Beta, dev, nightly, and canary channels add a suffix.
-    CHROMIUM
+    if CHROMIUM_MAC
         .iter()
         .any(|base| id == *base || id.strip_prefix(base).is_some_and(|s| s.starts_with('.')))
-        .then_some(Browser::Chromium)
+    {
+        return Some(Browser::Chromium);
+    }
+
+    // Firefox / Zen on Linux or macOS
+    const FIREFOX_NAMES: [&str; 6] = [
+        "firefox",
+        "org.mozilla.firefox",
+        "zen",
+        "zen-browser",
+        "zen-alpha",
+        "app.zen_browser.zen",
+    ];
+    if FIREFOX_NAMES.iter().any(|base| {
+        id == *base
+            || id.strip_prefix(base).is_some_and(|s| s.starts_with('-') || s.starts_with('.'))
+    }) {
+        return Some(Browser::Firefox);
+    }
+
+    // Linux WM_CLASS and desktop names
+    const LINUX_CHROMIUM: [&str; 9] = [
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "brave-browser",
+        "vivaldi",
+        "vivaldi-stable",
+        "microsoft-edge",
+        "microsoft-edge-stable",
+    ];
+    if LINUX_CHROMIUM.iter().any(|base| {
+        id == *base
+            || id.strip_prefix(base).is_some_and(|s| s.starts_with('-') || s.starts_with('.'))
+    }) {
+        return Some(Browser::Chromium);
+    }
+
+    None
 }
 
 fn safe_bundle_id(id: &str) -> bool {
@@ -141,9 +182,66 @@ fn safe_bundle_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
 }
 
+/// Extracts a localhost or 127.0.0.1 development server URL from a browser window title.
+pub fn extract_localhost_url_from_title(title: &str) -> Option<String> {
+    let tokens = title.split(|c: char| {
+        c.is_whitespace() || c == '—' || c == '–' || c == '|' || c == '(' || c == ')' || c == '[' || c == ']'
+    });
+
+    const SCHEMED_PREFIXES: [&str; 8] = [
+        "http://localhost:",
+        "https://localhost:",
+        "http://127.0.0.1:",
+        "https://127.0.0.1:",
+        "http://[::1]:",
+        "https://[::1]:",
+        "http://0.0.0.0:",
+        "https://0.0.0.0:",
+    ];
+
+    const BARE_PREFIXES: [&str; 4] = [
+        "localhost:",
+        "127.0.0.1:",
+        "[::1]:",
+        "0.0.0.0:",
+    ];
+
+    for raw in tokens {
+        let token = raw.trim_matches(|c: char| {
+            c.is_whitespace() || "()[]{}<>\"',;|".contains(c)
+        });
+        if token.is_empty() {
+            continue;
+        }
+
+        let token = token.trim_start_matches('-');
+
+        for prefix in SCHEMED_PREFIXES {
+            if let Some(rest) = token.strip_prefix(prefix) {
+                if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                    let cleaned = token.trim_end_matches(|c: char| ".,;:!?)>]'\"-".contains(c));
+                    return Some(cleaned.to_string());
+                }
+            }
+        }
+
+        for prefix in BARE_PREFIXES {
+            if let Some(rest) = token.strip_prefix(prefix) {
+                if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                    let cleaned = token.trim_end_matches(|c: char| ".,;:!?)>]'\"-".contains(c));
+                    return Some(format!("http://{cleaned}"));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// The front tab's URL in the browser `bundle_id`, through AppleScript. The first time macOS
 /// asks whether Scrawl may control the browser; while that prompt is up this waits a few
 /// seconds, then gives up for this capture. A denial just returns `None`.
+#[cfg(target_os = "macos")]
 pub fn browser_tab_url(bundle_id: &str) -> Option<String> {
     let kind = browser_kind(bundle_id)?;
     if !safe_bundle_id(bundle_id) {
@@ -152,6 +250,7 @@ pub fn browser_tab_url(bundle_id: &str) -> Option<String> {
     let tab = match kind {
         Browser::Chromium => "active tab",
         Browser::Safari => "current tab",
+        Browser::Firefox => return None,
     };
     let script = format!(
         "tell application id \"{bundle_id}\"\nif (count of windows) is 0 then return \"\"\nreturn URL of {tab} of front window\nend tell"
@@ -169,6 +268,37 @@ pub fn browser_tab_url(bundle_id: &str) -> Option<String> {
     }
     let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     (!url.is_empty()).then_some(url)
+}
+
+/// The front tab's URL in the browser `bundle_id` on Linux.
+#[cfg(target_os = "linux")]
+pub fn browser_tab_url(bundle_id: &str) -> Option<String> {
+    let kind = browser_kind(bundle_id)?;
+
+    // 1. Scan open windows (front to back) for a localhost URL in the title
+    let windows = crate::windows::raw_windows();
+    let title_url = windows.iter().find_map(|w| {
+        let is_browser = browser_kind(&w.owner) == Some(kind)
+            || bundle_id.eq_ignore_ascii_case(&w.owner)
+            || browser_kind(&w.owner).is_some();
+        if is_browser && !w.title.is_empty() {
+            extract_localhost_url_from_title(&w.title)
+        } else {
+            None
+        }
+    });
+
+    if let Some(url) = title_url {
+        return Some(url);
+    }
+
+    // 2. Fall back to the most recent registration from web::recent_origin()
+    crate::web::recent_origin()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn browser_tab_url(_bundle_id: &str) -> Option<String> {
+    crate::web::recent_origin()
 }
 
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<std::process::Output> {
@@ -208,6 +338,39 @@ pub fn capture_url(
 
 // MARK: Port → project
 
+/// Parses `/proc/net/tcp` and `/proc/net/tcp6` lines in state `0A` (`TCP_LISTEN`) matching `port`.
+pub fn parse_proc_net_tcp_inodes(content: &str, port: u16) -> Vec<u64> {
+    let mut inodes = Vec::new();
+    for line in content.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 10 {
+            continue;
+        }
+        if !cols[0].ends_with(':') {
+            continue;
+        }
+        if !cols[3].eq_ignore_ascii_case("0A") {
+            continue;
+        }
+        let Some((_, port_hex)) = cols[1].split_once(':') else {
+            continue;
+        };
+        let Ok(parsed_port) = u16::from_str_radix(port_hex, 16) else {
+            continue;
+        };
+        if parsed_port != port {
+            continue;
+        }
+        let Ok(inode) = cols[9].parse::<u64>() else {
+            continue;
+        };
+        if inode > 0 && !inodes.contains(&inode) {
+            inodes.push(inode);
+        }
+    }
+    inodes
+}
+
 /// PIDs in `lsof -F p` output (`p1234` lines), in order, without repeats.
 pub fn parse_lsof_pids(output: &str) -> Vec<i32> {
     let mut pids = Vec::new();
@@ -233,17 +396,22 @@ pub fn parse_lsof_cwd(output: &str) -> Option<PathBuf> {
 }
 
 fn lsof(args: &[&str]) -> Option<String> {
-    let output = run_with_timeout(
-        Command::new("/usr/sbin/lsof").args(args),
-        Duration::from_secs(3),
-    )?;
-    // lsof exits 1 when some of what it was asked about wasn't found.
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    (!text.trim().is_empty()).then_some(text)
+    const BINARIES: [&str; 3] = ["/usr/bin/lsof", "/usr/sbin/lsof", "lsof"];
+    for bin in BINARIES {
+        if let Some(output) = run_with_timeout(
+            Command::new(bin).args(args),
+            Duration::from_secs(3),
+        ) {
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            if !text.trim().is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
 }
 
-/// The working directory of the process listening on TCP `port` on this Mac.
-pub fn listener_directory(port: u16) -> Option<PathBuf> {
+fn lsof_listener_directory(port: u16) -> Option<PathBuf> {
     let pids = parse_lsof_pids(&lsof(&[
         "-nP",
         &format!("-iTCP:{port}"),
@@ -254,6 +422,75 @@ pub fn listener_directory(port: u16) -> Option<PathBuf> {
         parse_lsof_cwd(&lsof(&["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])?)
             .filter(|dir| dir != Path::new("/"))
     })
+}
+
+/// The working directory of the process listening on TCP `port`.
+#[cfg(target_os = "linux")]
+pub fn listener_directory(port: u16) -> Option<PathBuf> {
+    // 1. Try reading /proc/net/tcp and /proc/net/tcp6
+    let mut inodes = Vec::new();
+    if let Ok(content) = std::fs::read_to_string("/proc/net/tcp") {
+        for inode in parse_proc_net_tcp_inodes(&content, port) {
+            if !inodes.contains(&inode) {
+                inodes.push(inode);
+            }
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string("/proc/net/tcp6") {
+        for inode in parse_proc_net_tcp_inodes(&content, port) {
+            if !inodes.contains(&inode) {
+                inodes.push(inode);
+            }
+        }
+    }
+
+    if !inodes.is_empty() {
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            let mut pids = Vec::new();
+            for entry in entries.flatten() {
+                if let Ok(file_name) = entry.file_name().into_string() {
+                    if let Ok(pid) = file_name.parse::<i32>() {
+                        if pid > 0 {
+                            pids.push(pid);
+                        }
+                    }
+                }
+            }
+            pids.sort_unstable();
+            for pid in pids {
+                let fd_dir = format!("/proc/{pid}/fd");
+                let Ok(fd_entries) = std::fs::read_dir(&fd_dir) else {
+                    continue;
+                };
+                for fd_entry in fd_entries.flatten() {
+                    let Ok(target) = std::fs::read_link(fd_entry.path()) else {
+                        continue;
+                    };
+                    let target_str = target.to_string_lossy();
+                    for &inode in &inodes {
+                        let needle = format!("socket:[{inode}]");
+                        if target_str == needle {
+                            let cwd_path = format!("/proc/{pid}/cwd");
+                            if let Ok(cwd) = std::fs::read_link(&cwd_path) {
+                                if cwd != Path::new("/") {
+                                    return Some(cwd);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fall back to lsof if /proc yields nothing
+    lsof_listener_directory(port)
+}
+
+/// The working directory of the process listening on TCP `port`.
+#[cfg(not(target_os = "linux"))]
+pub fn listener_directory(port: u16) -> Option<PathBuf> {
+    lsof_listener_directory(port)
 }
 
 /// The project a directory belongs to: its git root (a `.git` directory or worktree file), or
@@ -485,6 +722,42 @@ mod tests {
         assert_eq!(browser_kind("com.apple.Safari"), Some(Browser::Safari));
         assert_eq!(browser_kind("com.mitchellh.ghostty"), None);
         assert_eq!(browser_kind("com.google.Chromecast"), None);
+    }
+
+    #[test]
+    fn proc_net_tcp_parser_finds_listening_ipv4_and_ipv6_inodes_and_skips_established_clients() {
+        // Review Focus #5: state 0A (TCP_LISTEN) on IPv4 (127.0.0.1:5173 -> 0100007F:1435),
+        // IPv6 ::1:5173, and IPv4-mapped ::ffff:127.0.0.1:3000 (0BB8), while ignoring state 01 (TCP_ESTABLISHED).
+        let tcp4 = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1435 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 424242 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:1435 0100007F:D120 01 00000000:00000000 00:00000000 00000000  1000        0 999999 1 0000000000000000 20 4 30 10 -1
+";
+        assert_eq!(parse_proc_net_tcp_inodes(tcp4, 5173), vec![424242]);
+        assert!(parse_proc_net_tcp_inodes(tcp4, 3000).is_empty());
+
+        let tcp6 = "\
+  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000001000000:1435 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 555555 1 0000000000000000 100 0 0 10 0
+   1: 0000000000000000FFFF00000100007F:0BB8 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 777777 1 0000000000000000 100 0 0 10 0
+";
+        assert_eq!(parse_proc_net_tcp_inodes(tcp6, 5173), vec![555555]);
+        assert_eq!(parse_proc_net_tcp_inodes(tcp6, 3000), vec![777777]);
+    }
+
+    #[test]
+    fn browser_kind_and_window_title_url_extraction_work_for_linux_browsers() {
+        assert!(browser_kind("google-chrome").is_some());
+        assert!(browser_kind("firefox").is_some());
+        assert!(browser_kind("brave-browser").is_some());
+        assert_eq!(
+            extract_localhost_url_from_title("localhost:5173/dashboard - Google Chrome").as_deref(),
+            Some("http://localhost:5173/dashboard")
+        );
+        assert_eq!(
+            extract_localhost_url_from_title("http://127.0.0.1:3000 — Mozilla Firefox").as_deref(),
+            Some("http://127.0.0.1:3000")
+        );
     }
 
     #[test]

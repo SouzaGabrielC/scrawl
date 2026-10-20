@@ -129,6 +129,27 @@ pub fn lookup(url: &str) -> Option<Registration> {
     remote.lookup(url, now)
 }
 
+/// All live registrations currently held or fetched from the ingest server.
+pub fn registrations() -> Vec<Registration> {
+    let now = crate::now_epoch_ms();
+    if SERVING.load(Ordering::Acquire) {
+        return registry().live(now);
+    }
+    let port = std::env::var("SCRAWL_INGEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(crate::phone::DEFAULT_INGEST_PORT);
+    fetch_registrations(port).unwrap_or_default()
+}
+
+/// The origin of the most recently seen active registration, if any.
+pub fn recent_origin() -> Option<String> {
+    registrations()
+        .into_iter()
+        .max_by_key(|r| r.seen_ms)
+        .map(|r| r.origin)
+}
+
 /// The running server's live registrations (`GET /web/registrations` with the ingest token).
 pub fn fetch_registrations(port: u16) -> Result<Vec<Registration>> {
     let token = crate::handoff::ensure_ingest_token()?;

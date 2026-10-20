@@ -17,7 +17,7 @@ pub mod camera;
 pub mod crop;
 pub mod ink;
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -74,16 +74,26 @@ pub struct Exported {
     pub bytes: u64,
 }
 
-/// Where `~/Movies/Scrawl/<bundle>.mp4` goes for a bundle.
+/// Where `~/Movies/Scrawl/<bundle>.mp4` goes for a bundle (or `~/Videos/Scrawl` on Linux).
 pub fn default_output(bundle_dir: &Path) -> PathBuf {
     let name = bundle_dir
         .file_stem()
         .and_then(|n| n.to_str())
         .unwrap_or("scrawl");
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Movies/Scrawl")
-        .join(format!("{name}.mp4"))
+    #[cfg(target_os = "linux")]
+    {
+        let video_dir = dirs::video_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join("Videos")))
+            .unwrap_or_else(|| PathBuf::from("."));
+        video_dir.join("Scrawl").join(format!("{name}.mp4"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Movies/Scrawl")
+            .join(format!("{name}.mp4"))
+    }
 }
 
 #[derive(Serialize)]
@@ -102,6 +112,25 @@ struct Plan<'a> {
     crop: Rect,
     camera: Option<Vec<[f64; 5]>>,
     ink: &'a ink::InkPlan,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanOwned {
+    video: PathBuf,
+    out: PathBuf,
+    audio: Option<PathBuf>,
+    audio_start_ms: u64,
+    audio_length_ms: u64,
+    width: u32,
+    height: u32,
+    fps: u32,
+    codec: String,
+    duration_ms: u64,
+    crop: Rect,
+    camera: Option<Vec<[f64; 5]>>,
+    ink: ink::InkPlan,
 }
 
 /// What the helper's `export` reports when it is done.
@@ -339,6 +368,7 @@ fn wav_duration_ms(path: &Path) -> Result<u64> {
 
 /// Runs `scrawl-helper export PLAN`, reading its JSON lines: `{"progress": f}` and a final
 /// `{"done": {...}}`.
+#[cfg(target_os = "macos")]
 fn run_helper(plan: &Path, background: bool, progress: &mut dyn FnMut(f32)) -> Result<Done> {
     let helper = crate::helper::path()?;
     let mut command = if background {
@@ -381,6 +411,195 @@ fn run_helper(plan: &Path, background: bool, progress: &mut dyn FnMut(f32)) -> R
         bail!("{}", message.trim());
     }
     done.context("scrawl-helper finished without a result")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_helper(plan_path: &Path, background: bool, progress: &mut dyn FnMut(f32)) -> Result<Done> {
+    let bytes = std::fs::read(plan_path)?;
+    let plan: PlanOwned = serde_json::from_slice(&bytes)
+        .context("Failed to parse export plan JSON")?;
+
+    let probe = crate::helper::probe(&plan.video)?;
+    let total_frames = ((plan.duration_ms as f64 * plan.fps as f64) / 1000.0).round() as u64;
+    ensure!(total_frames > 0, "No frames to export");
+
+    let out_w = plan.width;
+    let out_h = plan.height;
+    let fps = plan.fps;
+
+    let mut enc_cmd = if background {
+        let mut c = Command::new("nice");
+        c.args(["-n", "19", "ionice", "-c", "3", "ffmpeg"]);
+        c
+    } else {
+        Command::new("ffmpeg")
+    };
+    enc_cmd
+        .args(["-loglevel", "error", "-y"])
+        .args([
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-s",
+            &format!("{out_w}x{out_h}"),
+            "-r",
+            &fps.to_string(),
+            "-i",
+            "-",
+        ]);
+
+    if let Some(ref audio_path) = plan.audio {
+        let start_sec = format!("{:.3}", plan.audio_start_ms as f64 / 1000.0);
+        let len_sec = format!("{:.3}", plan.audio_length_ms as f64 / 1000.0);
+        enc_cmd.args(["-ss", &start_sec, "-t", &len_sec, "-i"])
+            .arg(audio_path);
+    }
+
+    if plan.codec == "hevc" {
+        enc_cmd.args(["-c:v", "libx265", "-crf", "24"]);
+    } else {
+        enc_cmd.args(["-c:v", "libx264", "-crf", "20"]);
+    }
+    enc_cmd.args(["-pix_fmt", "yuv420p", "-preset", "veryfast"]);
+
+    if plan.audio.is_some() {
+        enc_cmd.args(["-c:a", "aac", "-b:a", "192k"]);
+    }
+    enc_cmd.arg(&plan.out)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let mut enc_child = enc_cmd.spawn()
+        .context("Failed to start ffmpeg encoder")?;
+    let mut enc_stdin = enc_child.stdin.take().context("No encoder stdin")?;
+    let mut enc_stderr = enc_child.stderr.take().context("No encoder stderr")?;
+    let enc_errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = enc_stderr.read_to_string(&mut text);
+        text
+    });
+
+    let mut dec_cmd = if background {
+        let mut c = Command::new("nice");
+        c.args(["-n", "19", "ionice", "-c", "3", "ffmpeg"]);
+        c
+    } else {
+        Command::new("ffmpeg")
+    };
+    dec_cmd
+        .args(["-loglevel", "error", "-i"])
+        .arg(&plan.video)
+        .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut dec_child = dec_cmd.spawn()
+        .context("Failed to start ffmpeg decoder")?;
+    let mut dec_stdout = dec_child.stdout.take().context("No decoder stdout")?;
+
+    let src_w = probe.width;
+    let src_h = probe.height;
+    let src_frame_bytes = (src_w as usize) * (src_h as usize) * 4;
+    let out_frame_bytes = (out_w as usize) * (out_h as usize) * 4;
+
+    let mut src_buf = vec![0u8; src_frame_bytes];
+    let mut out_buf = vec![0u8; out_frame_bytes];
+
+    for frame_idx in 0..total_frames {
+        let t_ms = (frame_idx as f64 * 1000.0 / fps as f64).round() as u64;
+        match dec_stdout.read_exact(&mut src_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+
+        let camera_rect = if let Some(ref keys) = plan.camera {
+            let after = keys.partition_point(|k| (k[0] as u64) <= t_ms);
+            if after == 0 {
+                [keys[0][1] as f32, keys[0][2] as f32, keys[0][3] as f32, keys[0][4] as f32]
+            } else if after >= keys.len() {
+                let last = &keys[keys.len() - 1];
+                [last[1] as f32, last[2] as f32, last[3] as f32, last[4] as f32]
+            } else {
+                let prev = &keys[after - 1];
+                let next = &keys[after];
+                let dt = next[0] - prev[0];
+                let f = if dt > 1e-4 { ((t_ms as f64 - prev[0]) / dt) as f32 } else { 0.0 };
+                [
+                    prev[1] as f32 + (next[1] as f32 - prev[1] as f32) * f,
+                    prev[2] as f32 + (next[2] as f32 - prev[2] as f32) * f,
+                    prev[3] as f32 + (next[3] as f32 - prev[3] as f32) * f,
+                    prev[4] as f32 + (next[4] as f32 - prev[4] as f32) * f,
+                ]
+            }
+        } else {
+            plan.crop
+        };
+
+        resample_crop_into(&src_buf, src_w, src_h, camera_rect, &mut out_buf, out_w, out_h);
+        #[cfg(target_os = "linux")]
+        if let Some(mut pixmap) = tiny_skia::PixmapMut::from_bytes(&mut out_buf, out_w, out_h) {
+            ink::render_frame_ink(&mut pixmap, &plan.ink, camera_rect, t_ms);
+        }
+        enc_stdin.write_all(&out_buf)?;
+
+        if total_frames > 0 && frame_idx % 15 == 0 {
+            progress((frame_idx as f32) / (total_frames as f32));
+        }
+    }
+
+    drop(enc_stdin);
+    drop(dec_stdout);
+    let _ = dec_child.kill();
+    let _ = dec_child.wait();
+    let enc_status = enc_child.wait()?;
+    let enc_msg = enc_errors.join().unwrap_or_default();
+    if !enc_status.success() {
+        bail!("ffmpeg encoder failed: {}", enc_msg.trim());
+    }
+
+    let bytes = std::fs::metadata(&plan.out)?.len();
+    progress(1.0);
+    Ok(Done {
+        duration_ms: plan.duration_ms,
+        bytes,
+    })
+}
+
+#[allow(dead_code)]
+fn resample_crop_into(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    crop: Rect,
+    dst: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+) {
+    let sx0 = (crop[0] * src_w as f32).clamp(0.0, src_w as f32);
+    let sy0 = (crop[1] * src_h as f32).clamp(0.0, src_h as f32);
+    let sx1 = (crop[2] * src_w as f32).clamp(sx0, src_w as f32);
+    let sy1 = (crop[3] * src_h as f32).clamp(sy0, src_h as f32);
+    let span_x = sx1 - sx0;
+    let span_y = sy1 - sy0;
+
+    for dy in 0..dst_h {
+        let sy = sy0 + (dy as f32 + 0.5) / dst_h as f32 * span_y;
+        let iy = (sy.floor() as usize).min(src_h as usize - 1);
+        let src_row = iy * src_w as usize * 4;
+        let dst_row = dy as usize * dst_w as usize * 4;
+
+        for dx in 0..dst_w {
+            let sx = sx0 + (dx as f32 + 0.5) / dst_w as f32 * span_x;
+            let ix = (sx.floor() as usize).min(src_w as usize - 1);
+            let src_px = src_row + ix * 4;
+            let dst_px = dst_row + dx as usize * 4;
+            dst[dst_px..dst_px + 4].copy_from_slice(&src[src_px..src_px + 4]);
+        }
+    }
 }
 
 /// What `scrawl export` prints.

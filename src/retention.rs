@@ -337,6 +337,7 @@ fn shrinkable(dir: &Path, manifest: &Manifest) -> Option<PathBuf> {
 /// Moves `path` to the Trash.
 pub type Trasher<'a> = &'a dyn Fn(&Path) -> Result<()>;
 
+#[cfg(target_os = "macos")]
 pub fn trash(path: &Path) -> Result<()> {
     let output = Command::new("/usr/bin/trash")
         .arg(path)
@@ -348,6 +349,172 @@ pub fn trash(path: &Path) -> Result<()> {
         path.display(),
         String::from_utf8_lossy(&output.stderr).trim()
     );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn trash(path: &Path) -> Result<()> {
+    if let Ok(output) = Command::new("gio").arg("trash").arg(path).output() {
+        if output.status.success() && !path.exists() {
+            return Ok(());
+        }
+    }
+    let trash_root = dirs::data_local_dir()
+        .map(|d| d.join("Trash"))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share/Trash")))
+        .unwrap_or_else(|| PathBuf::from(".Trash"));
+    move_to_xdg_trash_in(&trash_root, path)
+        .map(|_| ())
+        .with_context(|| format!("Could not move {} to XDG Trash", path.display()))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn trash(path: &Path) -> Result<()> {
+    let trash_root = PathBuf::from(".Trash");
+    move_to_xdg_trash_in(&trash_root, path)
+        .map(|_| ())
+        .context("Could not move to Trash")
+}
+
+/// Moves `target` into FreeDesktop.org Trash under `trash_root`.
+/// Follows FreeDesktop.org Trash specification v1.0:
+/// - Target is placed in `<trash_root>/files/<unique_name>`
+/// - Info metadata is placed in `<trash_root>/info/<unique_name>.trashinfo`
+pub fn move_to_xdg_trash_in(trash_root: &Path, target: &Path) -> std::io::Result<PathBuf> {
+    if !target.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Target does not exist: {}", target.display()),
+        ));
+    }
+    let abs_target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    let original_name = match target.file_name() {
+        Some(n) => n.to_string_lossy().into_owned(),
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Target has no file name",
+            ));
+        }
+    };
+
+    let files_dir = trash_root.join("files");
+    let info_dir = trash_root.join("info");
+    std::fs::create_dir_all(&files_dir)?;
+    std::fs::create_dir_all(&info_dir)?;
+
+    let mut unique_name = original_name.clone();
+    let mut counter = 1;
+    let (stem, ext_opt) = match original_name.rfind('.') {
+        Some(idx) if idx > 0 => (
+            original_name[..idx].to_string(),
+            Some(original_name[idx..].to_string()),
+        ),
+        _ => (original_name.clone(), None),
+    };
+
+    while files_dir.join(&unique_name).exists()
+        || info_dir.join(format!("{unique_name}.trashinfo")).exists()
+    {
+        unique_name = match &ext_opt {
+            Some(ext) => format!("{stem}.{counter}{ext}"),
+            None => format!("{stem}.{counter}"),
+        };
+        counter += 1;
+    }
+
+    let dest_path = files_dir.join(&unique_name);
+    let info_path = info_dir.join(format!("{unique_name}.trashinfo"));
+
+    let encoded_path = url_encode_path(&abs_target);
+    let deletion_date = format_iso8601_now();
+    let info_content =
+        format!("[Trash Info]\nPath={encoded_path}\nDeletionDate={deletion_date}\n");
+    std::fs::write(&info_path, info_content)?;
+
+    if let Err(err) = std::fs::rename(target, &dest_path) {
+        let copy_result = if target.is_dir() {
+            copy_dir_all(target, &dest_path).and_then(|()| std::fs::remove_dir_all(target))
+        } else {
+            std::fs::copy(target, &dest_path)
+                .and_then(|_| std::fs::remove_file(target))
+                .map(|_| ())
+        };
+        if let Err(copy_err) = copy_result {
+            let _ = std::fs::remove_file(&info_path);
+            let _ = if dest_path.is_dir() {
+                std::fs::remove_dir_all(&dest_path)
+            } else {
+                std::fs::remove_file(&dest_path)
+            };
+            return Err(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "Failed to move {} to {}: {copy_err}",
+                    target.display(),
+                    dest_path.display()
+                ),
+            ));
+        }
+    }
+
+    Ok(dest_path)
+}
+
+fn url_encode_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{:02X}", b);
+            }
+        }
+    }
+    out
+}
+
+fn format_iso8601_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (secs / 86400) as i64;
+    let time_of_day = (secs % 86400) as u32;
+    let hours = time_of_day / 3600;
+    let mins = (time_of_day % 3600) / 60;
+    let s = time_of_day % 60;
+
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02}T{hours:02}:{mins:02}:{s:02}")
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dest_child = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dest_child)?;
+        } else {
+            std::fs::copy(entry.path(), dest_child)?;
+        }
+    }
     Ok(())
 }
 
@@ -625,12 +792,24 @@ enum Job {
 
 static WORKER: std::sync::OnceLock<flume::Sender<Job>> = std::sync::OnceLock::new();
 
+#[cfg(target_os = "macos")]
 fn lower_priority() {
     // SAFETY: only changes the calling thread's scheduling class.
     unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
     }
 }
+
+#[cfg(target_os = "linux")]
+fn lower_priority() {
+    // SAFETY: renices current process/thread to lowest CPU priority on Linux.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn lower_priority() {}
 
 /// Starts the app's cleanup: a pass shortly after launch, then daily, plus shrinking each
 /// iPhone capture a minute after it's made.
@@ -1051,4 +1230,21 @@ mod tests {
         assert_eq!(format_bytes(72_247_194), "72 MB");
         assert_eq!(format_bytes(2_512_000_000), "2.5 GB");
     }
+
+    #[test]
+    fn xdg_trash_creates_files_and_info_entry() {
+        let tmp = TempDir::new("xdg-trash");
+        let trash_root = tmp.0.join("Trash");
+        let target = tmp.0.join("sample.txt");
+        std::fs::write(&target, "hello trash").unwrap();
+        let trashed_file = move_to_xdg_trash_in(&trash_root, &target).unwrap();
+        assert!(!target.exists());
+        assert!(trashed_file.exists());
+        let info_path = trash_root.join("info").join("sample.txt.trashinfo");
+        assert!(info_path.exists());
+        let info_content = std::fs::read_to_string(info_path).unwrap();
+        assert!(info_content.starts_with("[Trash Info]\nPath="));
+        assert!(info_content.contains("DeletionDate="));
+    }
 }
+

@@ -216,6 +216,315 @@ pub fn owned_window_at(
         .is_some_and(|w| w.pid == own_pid)
 }
 
+/// The active application in front of the desktop.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrontmostApp {
+    pub name: String,
+    pub bundle_id: Option<String>,
+    pub pid: i32,
+}
+
+/// Insets `geom` by GTK client-side decoration shadows (`_GTK_FRAME_EXTENTS`),
+/// or expands `geom` by server-side window manager decorations (`_NET_WM_EXTENTS`).
+pub fn apply_frame_extents(
+    geom: [f64; 4],
+    net_extents: Option<[i32; 4]>,
+    gtk_extents: Option<[i32; 4]>,
+) -> [f64; 4] {
+    if let Some([l, r, t, b]) = gtk_extents {
+        let (l, r, t, b) = (l as f64, r as f64, t as f64, b as f64);
+        let w = (geom[2] - (l + r)).max(1.0);
+        let h = (geom[3] - (t + b)).max(1.0);
+        [geom[0] + l, geom[1] + t, w, h]
+    } else if let Some([l, r, t, b]) = net_extents {
+        let (l, r, t, b) = (l as f64, r as f64, t as f64, b as f64);
+        let w = (geom[2] + (l + r)).max(1.0);
+        let h = (geom[3] + (t + b)).max(1.0);
+        [geom[0] - l, geom[1] - t, w, h]
+    } else {
+        geom
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn frontmost_external_pid() -> Option<i32> {
+    crate::capture::frontmost_external_pid()
+}
+
+#[cfg(target_os = "linux")]
+fn frontmost_external_pid() -> Option<i32> {
+    frontmost_application().map(|a| a.pid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn frontmost_external_pid() -> Option<i32> {
+    None
+}
+
+/// The frontmost active application.
+#[cfg(target_os = "macos")]
+pub fn frontmost_application() -> Option<FrontmostApp> {
+    crate::capture::frontmost_app_info().map(|(pid, name, bundle_id)| FrontmostApp {
+        name,
+        bundle_id,
+        pid,
+    })
+}
+
+/// The frontmost active application from X11 `_NET_ACTIVE_WINDOW`.
+#[cfg(target_os = "linux")]
+pub fn frontmost_application() -> Option<FrontmostApp> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
+
+    let (conn, screen_num) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots[screen_num].root;
+
+    let atom_active = conn
+        .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let prop = conn
+        .get_property(false, root, atom_active, AtomEnum::WINDOW, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?;
+    let win = prop.value32()?.next()?;
+    if win == 0 {
+        return None;
+    }
+
+    // Read PID
+    let atom_pid = conn
+        .intern_atom(false, b"_NET_WM_PID")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let pid_prop = conn
+        .get_property(false, win, atom_pid, AtomEnum::CARDINAL, 0, 1)
+        .ok()
+        .and_then(|c| c.reply().ok());
+    let pid = pid_prop
+        .and_then(|p| p.value32())
+        .and_then(|mut it| it.next())
+        .unwrap_or(0) as i32;
+
+    // Read WM_CLASS
+    let class_prop = conn
+        .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 1024)
+        .ok()
+        .and_then(|c| c.reply().ok());
+    let (res_name, res_class) = class_prop
+        .map(|p| {
+            let bytes = p.value;
+            let parts: Vec<&str> = std::str::from_utf8(&bytes)
+                .unwrap_or("")
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .collect();
+            let name = parts.first().copied().unwrap_or("").to_string();
+            let class = parts.get(1).copied().unwrap_or(&name).to_string();
+            (name, class)
+        })
+        .unwrap_or_default();
+
+    // Read _NET_WM_NAME or WM_NAME
+    let atom_utf8 = conn
+        .intern_atom(false, b"UTF8_STRING")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let atom_net_wm_name = conn
+        .intern_atom(false, b"_NET_WM_NAME")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let title = conn
+        .get_property(false, win, atom_net_wm_name, atom_utf8, 0, 1024)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|p| String::from_utf8_lossy(&p.value).to_string())
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            conn.get_property(false, win, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 1024)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|p| String::from_utf8_lossy(&p.value).to_string())
+                .filter(|t| !t.is_empty())
+        })
+        .unwrap_or_default();
+
+    let name = if !res_class.is_empty() {
+        res_class.clone()
+    } else if pid > 0 {
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .unwrap_or(title)
+    } else {
+        title
+    };
+
+    let bundle_id = if !res_class.is_empty() {
+        Some(res_class.to_lowercase())
+    } else if !res_name.is_empty() {
+        Some(res_name.to_lowercase())
+    } else if pid > 0 {
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|s| s.trim().to_lowercase())
+    } else {
+        None
+    };
+
+    Some(FrontmostApp {
+        name,
+        bundle_id,
+        pid,
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn frontmost_application() -> Option<FrontmostApp> {
+    None
+}
+
+/// Activates an application window by PID or bundle ID.
+#[cfg(target_os = "macos")]
+pub fn activate_app(pid: i32, _bundle_id: Option<&str>) -> bool {
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+    if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
+        app.activateWithOptions(NSApplicationActivationOptions::empty())
+    } else {
+        false
+    }
+}
+
+/// Activates an application window by sending `_NET_ACTIVE_WINDOW` client message to the root window.
+#[cfg(target_os = "linux")]
+pub fn activate_app(pid: i32, bundle_id: Option<&str>) -> bool {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{self, AtomEnum, ConnectionExt};
+
+    let Ok((conn, screen_num)) = x11rb::connect(None) else {
+        return false;
+    };
+    let root = conn.setup().roots[screen_num].root;
+
+    let atom_active = conn
+        .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let Some(atom_active) = atom_active else {
+        return false;
+    };
+
+    let atom_stacking = conn
+        .intern_atom(false, b"_NET_CLIENT_LIST_STACKING")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_clients = conn
+        .intern_atom(false, b"_NET_CLIENT_LIST")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_pid = conn
+        .intern_atom(false, b"_NET_WM_PID")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+
+    let mut windows: Vec<xproto::Window> = Vec::new();
+    if let Some(atom_s) = atom_stacking {
+        if let Ok(prop) = conn
+            .get_property(false, root, atom_s, AtomEnum::WINDOW, 0, 1024)
+            .and_then(|c| c.reply())
+        {
+            if let Some(w) = prop.value32() {
+                windows = w.collect();
+            }
+        }
+    }
+    if windows.is_empty() {
+        if let Some(atom_c) = atom_clients {
+            if let Ok(prop) = conn
+                .get_property(false, root, atom_c, AtomEnum::WINDOW, 0, 1024)
+                .and_then(|c| c.reply())
+            {
+                if let Some(w) = prop.value32() {
+                    windows = w.collect();
+                }
+            }
+        }
+    }
+
+    // Search top-to-bottom
+    windows.reverse();
+
+    let mut target_win: Option<xproto::Window> = None;
+    for win in windows {
+        if pid > 0 && atom_pid.is_some() {
+            if let Ok(prop) = conn
+                .get_property(false, win, atom_pid.unwrap(), AtomEnum::CARDINAL, 0, 1)
+                .and_then(|c| c.reply())
+            {
+                if let Some(w_pid) = prop.value32().and_then(|mut it| it.next()) {
+                    if w_pid as i32 == pid {
+                        target_win = Some(win);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(target_bundle) = bundle_id {
+            if let Ok(prop) = conn
+                .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 1024)
+                .and_then(|c| c.reply())
+            {
+                let s = String::from_utf8_lossy(&prop.value);
+                if s.split('\0').any(|c| c.eq_ignore_ascii_case(target_bundle)) {
+                    target_win = Some(win);
+                    break;
+                }
+            }
+        }
+    }
+
+    let Some(win) = target_win else {
+        return false;
+    };
+
+    let event = xproto::ClientMessageEvent {
+        response_type: xproto::CLIENT_MESSAGE_EVENT,
+        format: 32,
+        sequence: 0,
+        window: win,
+        type_: atom_active,
+        data: xproto::ClientMessageData::from([2u32, 0u32, 0u32, 0u32, 0u32]),
+    };
+
+    let _ = conn.send_event(
+        false,
+        root,
+        xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+        event,
+    );
+    let _ = conn.flush();
+    true
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn activate_app(_pid: i32, _bundle_id: Option<&str>) -> bool {
+    false
+}
+
 /// Reads the on-screen window list (front to back) from the window server.
 #[cfg(target_os = "macos")]
 pub fn raw_windows() -> Vec<RawWindow> {
@@ -288,6 +597,300 @@ pub fn raw_windows() -> Vec<RawWindow> {
     out
 }
 
+/// Reads the on-screen window list (front to back) from X11 `_NET_CLIENT_LIST_STACKING`.
+#[cfg(target_os = "linux")]
+pub fn raw_windows() -> Vec<RawWindow> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{self, AtomEnum, ConnectionExt};
+
+    let Ok((conn, screen_num)) = x11rb::connect(None) else {
+        return Vec::new();
+    };
+    let root = conn.setup().roots[screen_num].root;
+
+    let atom_stacking = conn
+        .intern_atom(false, b"_NET_CLIENT_LIST_STACKING")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_clients = conn
+        .intern_atom(false, b"_NET_CLIENT_LIST")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_state = conn
+        .intern_atom(false, b"_NET_WM_STATE")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_hidden = conn
+        .intern_atom(false, b"_NET_WM_STATE_HIDDEN")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_net_wm_name = conn
+        .intern_atom(false, b"_NET_WM_NAME")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_utf8 = conn
+        .intern_atom(false, b"UTF8_STRING")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_pid = conn
+        .intern_atom(false, b"_NET_WM_PID")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_wtype = conn
+        .intern_atom(false, b"_NET_WM_WINDOW_TYPE")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_dock = conn
+        .intern_atom(false, b"_NET_WM_WINDOW_TYPE_DOCK")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_dialog = conn
+        .intern_atom(false, b"_NET_WM_WINDOW_TYPE_DIALOG")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_utility = conn
+        .intern_atom(false, b"_NET_WM_WINDOW_TYPE_UTILITY")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_toolbar = conn
+        .intern_atom(false, b"_NET_WM_WINDOW_TYPE_TOOLBAR")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_popup = conn
+        .intern_atom(false, b"_NET_WM_WINDOW_TYPE_POPUP_MENU")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_dropdown = conn
+        .intern_atom(false, b"_NET_WM_WINDOW_TYPE_DROPDOWN_MENU")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_net_extents = conn
+        .intern_atom(false, b"_NET_WM_EXTENTS")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_gtk_extents = conn
+        .intern_atom(false, b"_GTK_FRAME_EXTENTS")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_opacity = conn
+        .intern_atom(false, b"_NET_WM_WINDOW_OPACITY")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+
+    let mut windows: Vec<xproto::Window> = Vec::new();
+    if let Some(atom_s) = atom_stacking {
+        if let Ok(prop) = conn
+            .get_property(false, root, atom_s, AtomEnum::WINDOW, 0, 1024)
+            .and_then(|c| c.reply())
+        {
+            if let Some(w) = prop.value32() {
+                windows = w.collect();
+            }
+        }
+    }
+    if windows.is_empty() {
+        if let Some(atom_c) = atom_clients {
+            if let Ok(prop) = conn
+                .get_property(false, root, atom_c, AtomEnum::WINDOW, 0, 1024)
+                .and_then(|c| c.reply())
+            {
+                if let Some(w) = prop.value32() {
+                    windows = w.collect();
+                }
+            }
+        }
+    }
+
+    // Stacking list is bottom-to-top; reverse to front-to-back
+    windows.reverse();
+
+    let mut out = Vec::new();
+
+    for win in windows {
+        // Skip unviewable windows
+        let Ok(attrs) = conn.get_window_attributes(win).and_then(|c| c.reply()) else {
+            continue;
+        };
+        if attrs.map_state != xproto::MapState::VIEWABLE {
+            continue;
+        }
+
+        // Check _NET_WM_STATE for _NET_WM_STATE_HIDDEN
+        if let (Some(astate), Some(ahidden)) = (atom_state, atom_hidden) {
+            if let Ok(prop) = conn
+                .get_property(false, win, astate, AtomEnum::ATOM, 0, 64)
+                .and_then(|c| c.reply())
+            {
+                if let Some(states) = prop.value32() {
+                    if states.into_iter().any(|s| s == ahidden) {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Geometry in root window coordinates
+        let Ok(geom) = conn.get_geometry(win).and_then(|c| c.reply()) else {
+            continue;
+        };
+        let Ok(coords) = conn.translate_coordinates(win, root, 0, 0).and_then(|c| c.reply()) else {
+            continue;
+        };
+
+        let raw_bounds: [f64; 4] = [
+            coords.dst_x as f64,
+            coords.dst_y as f64,
+            geom.width as f64,
+            geom.height as f64,
+        ];
+
+        let get_extents = |atom: Option<xproto::Atom>| -> Option<[i32; 4]> {
+            let a = atom?;
+            let prop = conn.get_property(false, win, a, AtomEnum::CARDINAL, 0, 4).ok()?.reply().ok()?;
+            let v: Vec<u32> = prop.value32()?.collect();
+            if v.len() >= 4 {
+                Some([v[0] as i32, v[1] as i32, v[2] as i32, v[3] as i32])
+            } else {
+                None
+            }
+        };
+
+        let gtk_extents = get_extents(atom_gtk_extents);
+        let net_extents = get_extents(atom_net_extents);
+        let bounds = apply_frame_extents(raw_bounds, net_extents, gtk_extents);
+
+        // PID
+        let pid = atom_pid
+            .and_then(|ap| {
+                conn.get_property(false, win, ap, AtomEnum::CARDINAL, 0, 1)
+                    .ok()?
+                    .reply()
+                    .ok()?
+                    .value32()?
+                    .next()
+            })
+            .unwrap_or(0) as i32;
+
+        // Class & Owner
+        let mut owner = String::new();
+        if let Ok(prop) = conn
+            .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 1024)
+            .and_then(|c| c.reply())
+        {
+            let bytes = prop.value;
+            let parts: Vec<&str> = std::str::from_utf8(&bytes)
+                .unwrap_or("")
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .collect();
+            if let Some(class) = parts.get(1).or_else(|| parts.first()) {
+                owner = (*class).to_string();
+            }
+        }
+        if owner.is_empty() && pid > 0 {
+            owner = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+        }
+
+        // Title
+        let mut title = String::new();
+        if let (Some(aname), Some(autf8)) = (atom_net_wm_name, atom_utf8) {
+            if let Ok(prop) = conn
+                .get_property(false, win, aname, autf8, 0, 1024)
+                .and_then(|c| c.reply())
+            {
+                if !prop.value.is_empty() {
+                    title = String::from_utf8_lossy(&prop.value).to_string();
+                }
+            }
+        }
+        if title.is_empty() {
+            if let Ok(prop) = conn
+                .get_property(false, win, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 1024)
+                .and_then(|c| c.reply())
+            {
+                if !prop.value.is_empty() {
+                    title = String::from_utf8_lossy(&prop.value).to_string();
+                }
+            }
+        }
+
+        // Layer
+        let mut layer = 0i32;
+        if let Some(awtype) = atom_wtype {
+            if let Ok(prop) = conn
+                .get_property(false, win, awtype, AtomEnum::ATOM, 0, 16)
+                .and_then(|c| c.reply())
+            {
+                if let Some(types) = prop.value32() {
+                    let ts: Vec<u32> = types.collect();
+                    if atom_dock.is_some_and(|d| ts.contains(&d)) {
+                        layer = 20;
+                    } else if ts.iter().any(|t| {
+                        atom_dialog.is_some_and(|d| *t == d)
+                            || atom_utility.is_some_and(|u| *t == u)
+                            || atom_toolbar.is_some_and(|tb| *t == tb)
+                            || atom_popup.is_some_and(|p| *t == p)
+                            || atom_dropdown.is_some_and(|dd| *t == dd)
+                    }) {
+                        layer = 101;
+                    }
+                }
+            }
+        }
+
+        // Alpha / Opacity
+        let alpha = atom_opacity
+            .and_then(|ao| {
+                conn.get_property(false, win, ao, AtomEnum::CARDINAL, 0, 1)
+                    .ok()?
+                    .reply()
+                    .ok()?
+                    .value32()?
+                    .next()
+            })
+            .map(|op| (op as f64) / 4294967295.0)
+            .unwrap_or(1.0);
+
+        out.push(RawWindow {
+            id: win,
+            pid,
+            owner,
+            title,
+            bounds,
+            layer,
+            alpha,
+        });
+    }
+
+    out
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn raw_windows() -> Vec<RawWindow> {
+    Vec::new()
+}
+
+#[cfg(target_os = "macos")]
 fn app_meta_of(pid: i32) -> AppMeta {
     use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication};
     match NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
@@ -302,9 +905,35 @@ fn app_meta_of(pid: i32) -> AppMeta {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn app_meta_of(pid: i32) -> AppMeta {
+    if pid <= 0 {
+        return AppMeta {
+            bundle_id: None,
+            regular: false,
+        };
+    }
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string());
+    AppMeta {
+        bundle_id: comm.as_ref().map(|s| s.to_lowercase()),
+        regular: true,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn app_meta_of(_pid: i32) -> AppMeta {
+    AppMeta {
+        bundle_id: None,
+        regular: false,
+    }
+}
+
 /// The strip the Dock reserves on the display at `frame` (global top-left points), from the
 /// difference between the screen's frame and visible frame. `None` when the Dock hides or off
 /// the main thread (`NSScreen` is main-thread only).
+#[cfg(target_os = "macos")]
 pub fn dock_rect(frame: TargetFrame) -> Option<[f64; 4]> {
     use objc2::MainThreadMarker;
     use objc2_app_kit::NSScreen;
@@ -343,7 +972,40 @@ pub fn dock_rect(frame: TargetFrame) -> Option<[f64; 4]> {
     }
 }
 
+/// The strip the panel / dock reserves on the display at `frame` on Linux.
+#[cfg(target_os = "linux")]
+pub fn dock_rect(frame: TargetFrame) -> Option<[f64; 4]> {
+    let screens = crate::screens::current();
+    let screen = screens.iter().find(|s| {
+        (s.frame[0] - frame.x).abs() < 1.0
+            && (s.frame[1] - frame.y).abs() < 1.0
+            && (s.frame[2] - frame.width).abs() < 1.0
+            && (s.frame[3] - frame.height).abs() < 1.0
+    })?;
+    let [fx, fy, fw, fh] = screen.frame;
+    let [vx, vy, vw, vh] = screen.visible;
+    let (left, right, top, bottom) = (vx - fx, (fx + fw) - (vx + vw), vy - fy, (fy + fh) - (vy + vh));
+    let min = 8.0;
+    if bottom >= min {
+        Some([fx, vy + vh, fw, bottom])
+    } else if top >= min {
+        Some([fx, fy, fw, top])
+    } else if left >= min {
+        Some([fx, vy, left, vh])
+    } else if right >= min {
+        Some([vx + vw, vy, right, vh])
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn dock_rect(_frame: TargetFrame) -> Option<[f64; 4]> {
+    None
+}
+
 /// One timed snapshot of the windows overlapping `frame`.
+#[cfg(target_os = "macos")]
 pub fn snapshot(
     frame: TargetFrame,
     dock: Option<[f64; 4]>,
@@ -351,7 +1013,7 @@ pub fn snapshot(
 ) -> Vec<WindowEntry> {
     objc2::rc::autoreleasepool(|_| {
         let raw = raw_windows();
-        let front = crate::capture::frontmost_external_pid();
+        let front = frontmost_external_pid();
         filter_windows(
             &raw,
             frame,
@@ -363,6 +1025,41 @@ pub fn snapshot(
     })
 }
 
+/// One timed snapshot of the windows overlapping `frame` on Linux.
+#[cfg(target_os = "linux")]
+pub fn snapshot(
+    frame: TargetFrame,
+    dock: Option<[f64; 4]>,
+    cache: &mut HashMap<i32, AppMeta>,
+) -> Vec<WindowEntry> {
+    let raw = raw_windows();
+    let front = frontmost_external_pid();
+    filter_windows(
+        &raw,
+        frame,
+        std::process::id() as i32,
+        front,
+        dock,
+        &mut |pid| cache.entry(pid).or_insert_with(|| app_meta_of(pid)).clone(),
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn snapshot(
+    frame: TargetFrame,
+    dock: Option<[f64; 4]>,
+    cache: &mut HashMap<i32, AppMeta>,
+) -> Vec<WindowEntry> {
+    let raw = raw_windows();
+    filter_windows(
+        &raw,
+        frame,
+        std::process::id() as i32,
+        None,
+        dock,
+        &mut |pid| cache.entry(pid).or_insert_with(|| app_meta_of(pid)).clone(),
+    )
+}
 /// Background worker that logs windows and the cursor during a Screen-mode capture.
 ///
 /// Snapshots are taken at the start, right after `request` is raised (click, ink or laser
@@ -444,7 +1141,7 @@ fn run(
         if let Some([x, y]) = cursor {
             log.push_cursor(t, f64::from(x) - frame.x, f64::from(y) - frame.y, frame);
         }
-        let front = crate::capture::frontmost_external_pid();
+        let front = frontmost_external_pid();
         let since = last_snapshot.map(|s| s.elapsed());
         let moved = cursor != cursor_at_snapshot;
         let due = !finishing
@@ -469,6 +1166,23 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_extents_subtract_gtk_csd_shadows_and_add_server_decorations() {
+        // Review Focus #3: GTK4 window with 26px shadow on left/right/bottom and 22px on top:
+        let geom = [100.0, 50.0, 852.0, 648.0];
+        let gtk = Some([26, 26, 22, 26]); // left, right, top, bottom
+        assert_eq!(
+            apply_frame_extents(geom, None, gtk),
+            [126.0, 72.0, 800.0, 600.0]
+        );
+        // Server-side window manager frame (_NET_WM_EXTENTS) with 32px titlebar:
+        let net = Some([0, 0, 32, 0]);
+        assert_eq!(
+            apply_frame_extents([100.0, 82.0, 800.0, 600.0], net, None),
+            [100.0, 50.0, 800.0, 632.0]
+        );
+    }
 
     fn frame() -> TargetFrame {
         TargetFrame {

@@ -339,6 +339,7 @@ fn open_backdrop(display: [f32; 2], cx: &mut App) {
             is_resizable: false,
             is_minimizable: false,
             window_background: WindowBackgroundAppearance::Opaque,
+            #[cfg(target_os = "linux")]
             app_id: Some("scrawl".into()),
             ..Default::default()
         },

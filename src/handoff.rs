@@ -8,13 +8,20 @@ use serde::{Deserialize, Serialize};
 use crate::model::ScrawlBundle;
 
 pub fn default_captures_dir() -> PathBuf {
-    std::env::var_os("SCRAWL_CAPTURES_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("Library/Application Support/scrawl/captures")
-        })
+    if let Some(custom) = std::env::var_os("SCRAWL_CAPTURES_DIR") {
+        return PathBuf::from(custom);
+    }
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    #[cfg(target_os = "linux")]
+    {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| home.join(".local/share"))
+            .join("scrawl/captures")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        home.join("Library/Application Support/scrawl/captures")
+    }
 }
 
 pub fn resolve_bundle_dir(path_or_id: &Path) -> Result<PathBuf> {
@@ -134,17 +141,73 @@ pub fn copy_png_to_clipboard(png_bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
+static CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+fn with_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> Result<T>) -> Result<T> {
+    let mut guard = CLIPBOARD
+        .lock()
+        .map_err(|e| anyhow::anyhow!("Clipboard mutex poisoned: {e}"))?;
+    if guard.is_none() {
+        let cb = arboard::Clipboard::new()
+            .context("Failed to initialize X11 arboard clipboard")?;
+        *guard = Some(cb);
+    }
+    let cb = guard.as_mut().expect("clipboard initialized");
+    f(cb)
+}
+
+#[cfg(target_os = "linux")]
+pub fn copy_string_to_clipboard(content: &str) -> Result<()> {
+    with_clipboard(|cb| {
+        cb.set_text(content)
+            .context("Could not copy text to X11 clipboard")
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn copy_png_to_clipboard(png_bytes: &[u8]) -> Result<()> {
+    let img = image::load_from_memory(png_bytes)
+        .context("Could not decode PNG for clipboard")?;
+    let rgba = img.to_rgba8();
+    let image_data = arboard::ImageData {
+        width: rgba.width() as usize,
+        height: rgba.height() as usize,
+        bytes: std::borrow::Cow::Owned(rgba.into_raw()),
+    };
+    with_clipboard(|cb| {
+        cb.set_image(image_data)
+            .context("Could not copy image to X11 clipboard")
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn copy_string_to_clipboard(_content: &str) -> Result<()> {
+    bail!("Clipboard copy requires macOS or Linux")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn copy_png_to_clipboard(_png_bytes: &[u8]) -> Result<()> {
+    bail!("Clipboard copy requires macOS or Linux")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn copy_bundle_to_clipboard(bundle_dir: &Path) -> Result<()> {
     let (directory, bundle) = load_bundle(bundle_dir)?;
     let summary = crate::sketch::summary_markdown(&bundle, &directory);
     copy_string_to_clipboard(&summary)
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn copy_bundle_to_clipboard(_bundle_dir: &Path) -> Result<()> {
+    bail!("Image and text clipboard handoff requires macOS or Linux")
+}
+
 /// Pastes both the contact-sheet image and the transcript/keyframe text into the active app
 /// as a two-step sequence (`⌘V` image, then `⌘V` text). If `click_target` is provided (from
 /// dragging the Paste chip onto a window/input), clicks at that screen coordinate first to focus it.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn paste_bundle_at_target(bundle_dir: &Path, click_target: Option<[f32; 2]>) -> Result<()> {
     if let Some([x, y]) = click_target {
         crate::capture::post_synthetic_click(f64::from(x), f64::from(y));
@@ -153,6 +216,11 @@ pub fn paste_bundle_at_target(bundle_dir: &Path, click_target: Option<[f32; 2]>)
         crate::capture::ensure_external_app_active();
     }
     paste_bundle_image_and_text(bundle_dir)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn paste_bundle_at_target(_bundle_dir: &Path, _click_target: Option<[f32; 2]>) -> Result<()> {
+    bail!("Image and text paste handoff requires macOS or Linux")
 }
 
 #[cfg(target_os = "macos")]
@@ -182,19 +250,36 @@ pub fn paste_bundle_image_and_text(bundle_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn copy_bundle_to_clipboard(_bundle_dir: &Path) -> Result<()> {
-    bail!("Image and text clipboard handoff requires macOS")
+#[cfg(target_os = "linux")]
+pub fn paste_bundle_image_and_text(bundle_dir: &Path) -> Result<()> {
+    let (directory, bundle) = load_bundle(bundle_dir)?;
+    let sheet_path = directory.join(&bundle.contact_sheet);
+    let summary = crate::sketch::summary_markdown(&bundle, &directory);
+
+    crate::capture::wait_for_modifiers_released(350);
+
+    if crate::capture::is_frontmost_terminal() {
+        // OpenCode TUI: copy formatted summary with artifact paths, paste with Ctrl+Shift+V
+        copy_string_to_clipboard(&summary)?;
+        crate::capture::post_synthetic_paste(true);
+    } else {
+        // OpenChamber GUI: paste PNG contact sheet with Ctrl+V, then summary with Ctrl+V
+        if sheet_path.exists() {
+            let bytes = fs::read(&sheet_path)
+                .with_context(|| format!("Could not read contact sheet at {}", sheet_path.display()))?;
+            copy_png_to_clipboard(&bytes)?;
+            crate::capture::post_synthetic_paste(false);
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        }
+        copy_string_to_clipboard(&summary)?;
+        crate::capture::post_synthetic_paste(false);
+    }
+    Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn paste_bundle_image_and_text(_bundle_dir: &Path) -> Result<()> {
-    bail!("Image and text paste handoff requires macOS")
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn paste_bundle_at_target(_bundle_dir: &Path, _click_target: Option<[f32; 2]>) -> Result<()> {
-    bail!("Image and text paste handoff requires macOS")
+    bail!("Image and text paste handoff requires macOS or Linux")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1576,5 +1661,13 @@ mod session_lookup {
             resolve_opencode_session_with(get, None, Some("Nothing"), None).unwrap()
         });
         assert_eq!(result.0, "ses_00000");
+    }
+
+    #[test]
+    fn linux_default_captures_dir_respects_env_and_xdg_data_local() {
+        let custom = std::path::PathBuf::from("/tmp/scrawl-custom-captures");
+        unsafe { std::env::set_var("SCRAWL_CAPTURES_DIR", &custom) };
+        assert_eq!(default_captures_dir(), custom);
+        unsafe { std::env::remove_var("SCRAWL_CAPTURES_DIR") };
     }
 }

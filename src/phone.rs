@@ -102,6 +102,12 @@ impl PhoneSession {
         hidden: bool,
         telemetry: Option<Arc<SharedCaptureTelemetry>>,
     ) -> Result<Self> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (device_id, hidden, telemetry);
+            bail!("Cabled iPhone capture requires macOS");
+        }
+        #[cfg(target_os = "macos")]
         Self::spawn_mirror(None, hidden, device_id, telemetry)
     }
 
@@ -112,9 +118,16 @@ impl PhoneSession {
         device_id: Option<&str>,
         telemetry: Option<Arc<SharedCaptureTelemetry>>,
     ) -> Result<Self> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (movie, device_id, telemetry);
+            bail!("Cabled iPhone capture requires macOS");
+        }
+        #[cfg(target_os = "macos")]
         Self::spawn_mirror(Some(movie), false, device_id, telemetry)
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn spawn_mirror(
         movie: Option<&Path>,
         hidden: bool,
@@ -2344,5 +2357,18 @@ mod tests {
             reply_wait("POST /ingest HTTP/1.1\r\nX-Scrawl-Wait: 600\r\n"),
             REPLY_WAIT_MAX
         );
+    }
+
+    #[test]
+    fn phone_session_start_fails_on_non_macos() {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let res = PhoneSession::start(Path::new("dummy.mp4"), None, None);
+            assert!(res.is_err());
+            assert_eq!(
+                res.unwrap_err().to_string(),
+                "Cabled iPhone capture requires macOS"
+            );
+        }
     }
 }

@@ -10,11 +10,25 @@ use anyhow::Result;
 use crate::audio::RecordedAudio;
 use crate::model::TranscriptData;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
-    #[default]
     Apple,
     Hex,
+    Parakeet,
+    Whisper,
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self::Parakeet
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::Apple
+        }
+    }
 }
 
 impl Engine {
@@ -22,6 +36,8 @@ impl Engine {
         match name.trim().to_ascii_lowercase().as_str() {
             "apple" => Some(Self::Apple),
             "hex" => Some(Self::Hex),
+            "parakeet" => Some(Self::Parakeet),
+            "whisper" => Some(Self::Whisper),
             _ => None,
         }
     }
@@ -30,10 +46,12 @@ impl Engine {
         match self {
             Self::Apple => "apple",
             Self::Hex => "hex",
+            Self::Parakeet => "parakeet",
+            Self::Whisper => "whisper",
         }
     }
 
-    /// The configured engine: `"transcriber"` in the config file, Apple when missing or unknown.
+    /// The configured engine: `"transcriber"` in the config file, default when missing or unknown.
     pub fn configured() -> Self {
         crate::handoff::transcriber()
             .as_deref()
@@ -46,6 +64,8 @@ impl Engine {
         match OVERRIDE.load(Ordering::Relaxed) {
             1 => Self::Apple,
             2 => Self::Hex,
+            3 => Self::Parakeet,
+            4 => Self::Whisper,
             _ => Self::configured(),
         }
     }
@@ -112,6 +132,8 @@ pub fn set_override(engine: Engine) {
         match engine {
             Engine::Apple => 1,
             Engine::Hex => 2,
+            Engine::Parakeet => 3,
+            Engine::Whisper => 4,
         },
         Ordering::Relaxed,
     );
@@ -125,7 +147,90 @@ pub fn transcribe(wav: Option<&Path>, audio: Option<&RecordedAudio>) -> Transcri
             ..Default::default()
         };
     };
-    run(Engine::preferred(), || try_hex(audio), || apple(wav))
+    let engine = Engine::preferred();
+    match engine {
+        Engine::Parakeet => {
+            match crate::parakeet::transcribe_audio(audio) {
+                Ok(transcript) => transcript,
+                Err(error) => {
+                    crate::capture::scrawl_log(format!(
+                        "Parakeet transcription failed: {error:#}"
+                    ));
+                    #[cfg(target_os = "macos")]
+                    {
+                        apple(wav)
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        TranscriptData {
+                            source: "offline".into(),
+                            ..Default::default()
+                        }
+                    }
+                }
+            }
+        }
+        Engine::Whisper => {
+            // Whisper falls back to Parakeet on Linux
+            #[cfg(target_os = "linux")]
+            {
+                match crate::parakeet::transcribe_audio(audio) {
+                    Ok(transcript) => transcript,
+                    Err(error) => {
+                        crate::capture::scrawl_log(format!(
+                            "Whisper (Parakeet fallback) transcription failed: {error:#}"
+                        ));
+                        TranscriptData {
+                            source: "offline".into(),
+                            ..Default::default()
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                apple(wav)
+            }
+        }
+        Engine::Hex => {
+            run(Engine::Hex, || try_hex(audio), || {
+                #[cfg(target_os = "linux")]
+                {
+                    crate::parakeet::transcribe_audio(audio).unwrap_or_else(|error| {
+                        crate::capture::scrawl_log(format!(
+                            "Parakeet fallback failed: {error:#}"
+                        ));
+                        TranscriptData {
+                            source: "offline".into(),
+                            ..Default::default()
+                        }
+                    })
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    apple(wav)
+                }
+            })
+        }
+        Engine::Apple => {
+            #[cfg(target_os = "macos")]
+            {
+                apple(wav)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                crate::parakeet::transcribe_audio(audio).unwrap_or_else(|error| {
+                    crate::capture::scrawl_log(format!(
+                        "Apple requested on Linux, Parakeet fallback failed: {error:#}"
+                    ));
+                    TranscriptData {
+                        source: "offline".into(),
+                        ..Default::default()
+                    }
+                })
+            }
+        }
+    }
 }
 
 /// Hex first when preferred, with Apple as the answer to anything it can't do. `hex` returns
@@ -193,8 +298,21 @@ mod tests {
     fn engine_names_parse_and_unknown_is_not_an_engine() {
         assert_eq!(Engine::parse("hex"), Some(Engine::Hex));
         assert_eq!(Engine::parse(" Apple "), Some(Engine::Apple));
-        assert_eq!(Engine::parse("whisper"), None);
+        assert_eq!(Engine::parse("parakeet"), Some(Engine::Parakeet));
+        assert_eq!(Engine::parse("whisper"), Some(Engine::Whisper));
+        assert_eq!(Engine::parse("unknown"), None);
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(Engine::default(), Engine::Apple);
+        #[cfg(target_os = "linux")]
+        assert_eq!(Engine::default(), Engine::Parakeet);
+    }
+
+    #[test]
+    fn parakeet_and_whisper_engine_names_parse() {
+        assert_eq!(Engine::parse("parakeet"), Some(Engine::Parakeet));
+        assert_eq!(Engine::parse("whisper"), Some(Engine::Whisper));
+        #[cfg(target_os = "linux")]
+        assert_eq!(Engine::default(), Engine::Parakeet);
     }
 
     #[test]

@@ -30,10 +30,117 @@ pub struct Screen {
 }
 
 /// AppKit rect → global rect (and back: the flip is its own inverse). `primary_h` is the
-/// primary display's height.
+/// primary display's height. On Linux X11, coordinate space is already top-left Y-down,
+/// so this returns `r` unchanged.
+#[cfg(not(target_os = "linux"))]
 pub fn flip(r: Rect, primary_h: f64) -> Rect {
     [r[0], primary_h - r[1] - r[3], r[2], r[3]]
 }
+
+#[cfg(target_os = "linux")]
+pub fn flip(r: Rect, _primary_h: f64) -> Rect {
+    r
+}
+
+/// Computes the visible area of `frame` by intersecting with EWMH `_NET_WORKAREA`
+/// and subtracting `_NET_WM_STRUT_PARTIAL` insets.
+/// Falls back to `frame` if the visible rect would collapse width or height below 50% of `frame`.
+pub fn compute_workarea_visible(
+    frame: Rect,
+    workarea: Option<Rect>,
+    struts: &[[u32; 12]],
+) -> Rect {
+    let mut cur = if let Some(wa) = workarea {
+        let x0 = frame[0].max(wa[0]);
+        let y0 = frame[1].max(wa[1]);
+        let x1 = (frame[0] + frame[2]).min(wa[0] + wa[2]);
+        let y1 = (frame[1] + frame[3]).min(wa[1] + wa[3]);
+        let w = (x1 - x0).max(0.0);
+        let h = (y1 - y0).max(0.0);
+        if w >= frame[2] * 0.5 && h >= frame[3] * 0.5 {
+            [x0, y0, w, h]
+        } else {
+            frame
+        }
+    } else {
+        frame
+    };
+
+    for s in struts {
+        let left = s[0] as f64;
+        let right = s[1] as f64;
+        let top = s[2] as f64;
+        let bottom = s[3] as f64;
+
+        let left_sy = s[4] as f64;
+        let left_ey = s[5] as f64;
+        let right_sy = s[6] as f64;
+        let right_ey = s[7] as f64;
+        let top_sx = s[8] as f64;
+        let top_ex = s[9] as f64;
+        let bot_sx = s[10] as f64;
+        let bot_ex = s[11] as f64;
+
+        // Top strut (root-top relative)
+        if top > 0.0 && frame[1] < top && top_sx < (cur[0] + cur[2]) && top_ex > cur[0] {
+            let new_top = cur[1].max(top);
+            let cur_bot = cur[1] + cur[3];
+            if new_top < cur_bot {
+                cur[1] = new_top;
+                cur[3] = cur_bot - new_top;
+            }
+        }
+
+        // Bottom strut
+        if bottom > 0.0 && bot_sx < (cur[0] + cur[2]) && bot_ex > cur[0] {
+            let new_bot = (cur[1] + cur[3]).min(frame[1] + frame[3] - bottom);
+            if new_bot > cur[1] {
+                cur[3] = new_bot - cur[1];
+            }
+        }
+
+        // Left strut (root-left relative)
+        if left > 0.0 && frame[0] < left && left_sy < (cur[1] + cur[3]) && left_ey > cur[1] {
+            let new_left = cur[0].max(left);
+            let cur_right = cur[0] + cur[2];
+            if new_left < cur_right {
+                cur[0] = new_left;
+                cur[2] = cur_right - new_left;
+            }
+        }
+
+        // Right strut
+        if right > 0.0 && right_sy < (cur[1] + cur[3]) && right_ey > cur[1] {
+            let new_right = (cur[0] + cur[2]).min(frame[0] + frame[2] - right);
+            if new_right > cur[0] {
+                cur[2] = new_right - cur[0];
+            }
+        }
+    }
+
+    if cur[2] >= frame[2] * 0.5 && cur[3] >= frame[3] * 0.5 {
+        cur
+    } else {
+        frame
+    }
+}
+
+/// Parses the HiDPI scale factor from X11 `RESOURCE_MANAGER` string (looking for `Xft.dpi`).
+/// Divides DPI by 96.0 and clamps to `1.0..=4.0`.
+pub fn parse_xft_dpi(resource_manager: &str) -> Option<f64> {
+    for line in resource_manager.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Xft.dpi:") {
+            if let Ok(dpi) = rest.trim().parse::<f64>() {
+                if dpi.is_finite() && dpi > 0.0 {
+                    return Some((dpi / 96.0).clamp(1.0, 4.0));
+                }
+            }
+        }
+    }
+    None
+}
+
 
 pub fn contains(r: Rect, p: [f64; 2]) -> bool {
     p[0] >= r[0] && p[0] < r[0] + r[2] && p[1] >= r[1] && p[1] < r[1] + r[3]
@@ -152,6 +259,7 @@ pub fn pill_origin(screen: &Screen, width: f64, panel_y: f64) -> [f64; 2] {
 
 /// Every active display from CoreGraphics (any thread). `visible` is the whole frame and
 /// `safe_top` 0: only `NSScreen` knows the menu bar and the notch (`current`).
+#[cfg(target_os = "macos")]
 pub fn displays() -> Vec<Screen> {
     use core_graphics::display::CGDisplay;
     let ids = CGDisplay::active_displays().unwrap_or_default();
@@ -186,8 +294,116 @@ pub fn displays() -> Vec<Screen> {
     out
 }
 
+/// Every active display from X11 RandR (any thread).
+#[cfg(target_os = "linux")]
+pub fn displays() -> Vec<Screen> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::randr;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
+
+    let Ok((conn, screen_num)) = x11rb::connect(None) else {
+        return Vec::new();
+    };
+    let root = conn.setup().roots[screen_num].root;
+
+    // Detect DPI scale from RESOURCE_MANAGER property
+    let scale = conn
+        .get_property(
+            false,
+            root,
+            AtomEnum::RESOURCE_MANAGER,
+            AtomEnum::STRING,
+            0,
+            16 * 1024,
+        )
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .and_then(|prop| {
+            let s = String::from_utf8_lossy(&prop.value);
+            parse_xft_dpi(&s)
+        })
+        .or_else(|| {
+            std::env::var("GDK_SCALE")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|s| s.is_finite() && *s >= 1.0)
+        })
+        .unwrap_or(1.0);
+
+    let mut out = Vec::new();
+
+    // Try RandR 1.5 get_monitors
+    if let Ok(reply) = randr::get_monitors(&conn, root, true).and_then(|c| c.reply()) {
+        for (i, m) in reply.monitors.iter().enumerate() {
+            if m.width > 0 && m.height > 0 {
+                let frame: Rect = [
+                    m.x as f64,
+                    m.y as f64,
+                    m.width as f64,
+                    m.height as f64,
+                ];
+                out.push(Screen {
+                    id: i as u32,
+                    frame,
+                    visible: frame,
+                    scale,
+                    safe_top: 0.0,
+                });
+            }
+        }
+    }
+
+    // Fallback: CRTC resources
+    if out.is_empty() {
+        if let Ok(res) = randr::get_screen_resources_current(&conn, root).and_then(|c| c.reply()) {
+            for (i, &crtc) in res.crtcs.iter().enumerate() {
+                if let Ok(ci) = randr::get_crtc_info(&conn, crtc, res.config_timestamp).and_then(|c| c.reply()) {
+                    if ci.width > 0 && ci.height > 0 {
+                        let frame: Rect = [
+                            ci.x as f64,
+                            ci.y as f64,
+                            ci.width as f64,
+                            ci.height as f64,
+                        ];
+                        out.push(Screen {
+                            id: if crtc > 0 { crtc } else { i as u32 },
+                            frame,
+                            visible: frame,
+                            scale,
+                            safe_top: 0.0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: Root window dimensions
+    if out.is_empty() {
+        let s = &conn.setup().roots[screen_num];
+        let frame: Rect = [0.0, 0.0, s.width_in_pixels as f64, s.height_in_pixels as f64];
+        out.push(Screen {
+            id: 0,
+            frame,
+            visible: frame,
+            scale,
+            safe_top: 0.0,
+        });
+    }
+
+    // Primary display (origin 0,0) first
+    out.sort_by_key(|s| !(s.frame[0] == 0.0 && s.frame[1] == 0.0));
+    out
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn displays() -> Vec<Screen> {
+    Vec::new()
+}
+
 /// Every screen with its menu bar, Dock and notch, from `NSScreen` (main thread only; falls
 /// back to `displays` elsewhere).
+#[cfg(target_os = "macos")]
 pub fn current() -> Vec<Screen> {
     use objc2::MainThreadMarker;
     use objc2_app_kit::NSScreen;
@@ -226,10 +442,144 @@ pub fn current() -> Vec<Screen> {
     out
 }
 
+/// Every screen with EWMH `_NET_WORKAREA` / `_NET_WM_STRUT_PARTIAL` applied to `visible`
+/// and `safe_top: 0.0`.
+#[cfg(target_os = "linux")]
+pub fn current() -> Vec<Screen> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
+
+    let mut out = displays();
+    if out.is_empty() {
+        return out;
+    }
+
+    let Ok((conn, screen_num)) = x11rb::connect(None) else {
+        return out;
+    };
+    let root = conn.setup().roots[screen_num].root;
+
+    // Read _NET_WORKAREA
+    let atom_workarea = conn
+        .intern_atom(false, b"_NET_WORKAREA")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let workarea: Option<Rect> = atom_workarea.and_then(|atom| {
+        conn.get_property(false, root, atom, AtomEnum::CARDINAL, 0, 4)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|prop| {
+                let vals: Vec<u32> = prop.value32()?.collect();
+                if vals.len() >= 4 {
+                    Some([vals[0] as f64, vals[1] as f64, vals[2] as f64, vals[3] as f64])
+                } else {
+                    None
+                }
+            })
+    });
+
+    // Read struts from client windows
+    let atom_clients = conn
+        .intern_atom(false, b"_NET_CLIENT_LIST")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_strut_partial = conn
+        .intern_atom(false, b"_NET_WM_STRUT_PARTIAL")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+    let atom_strut = conn
+        .intern_atom(false, b"_NET_WM_STRUT")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom);
+
+    let mut struts: Vec<[u32; 12]> = Vec::new();
+    if let Some(atom_c) = atom_clients {
+        if let Ok(prop) = conn
+            .get_property(false, root, atom_c, AtomEnum::WINDOW, 0, 1024)
+            .and_then(|c| c.reply())
+        {
+            if let Some(windows) = prop.value32() {
+                for win in windows {
+                    let mut found_strut = false;
+                    if let Some(asp) = atom_strut_partial {
+                        if let Ok(sp) = conn
+                            .get_property(false, win, asp, AtomEnum::CARDINAL, 0, 12)
+                            .and_then(|c| c.reply())
+                        {
+                            if let Some(vals) = sp.value32() {
+                                let v: Vec<u32> = vals.collect();
+                                if v.len() >= 12 {
+                                    let mut arr = [0u32; 12];
+                                    arr.copy_from_slice(&v[..12]);
+                                    struts.push(arr);
+                                    found_strut = true;
+                                }
+                            }
+                        }
+                    }
+                    if !found_strut {
+                        if let Some(as4) = atom_strut {
+                            if let Ok(sp) = conn
+                                .get_property(false, win, as4, AtomEnum::CARDINAL, 0, 4)
+                                .and_then(|c| c.reply())
+                            {
+                                if let Some(vals) = sp.value32() {
+                                    let v: Vec<u32> = vals.collect();
+                                    if v.len() >= 4 {
+                                        struts.push([
+                                            v[0], v[1], v[2], v[3],
+                                            0, u32::MAX, 0, u32::MAX, 0, u32::MAX, 0, u32::MAX,
+                                        ]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for s in out.iter_mut() {
+        s.visible = compute_workarea_visible(s.frame, workarea, &struts);
+        s.safe_top = 0.0;
+    }
+
+    out
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn current() -> Vec<Screen> {
+    displays()
+}
+
 /// The global pointer, from `CGEvent` (any thread).
+#[cfg(target_os = "macos")]
 pub fn pointer() -> Option<[f64; 2]> {
     crate::capture::current_mouse_screen().map(|[x, y]| [f64::from(x), f64::from(y)])
 }
+
+/// The global pointer, from X11 `QueryPointer` (any thread).
+#[cfg(target_os = "linux")]
+pub fn pointer() -> Option<[f64; 2]> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::ConnectionExt;
+
+    let (conn, screen_num) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots[screen_num].root;
+    let reply = conn.query_pointer(root).ok()?.reply().ok()?;
+    Some([f64::from(reply.root_x), f64::from(reply.root_y)])
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn pointer() -> Option<[f64; 2]> {
+    None
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -251,6 +601,40 @@ mod tests {
     /// The laptop plus one external display at `frame`.
     fn pair(frame: Rect, scale: f64) -> [Screen; 2] {
         [screen(1, LAPTOP, 2.0), screen(2, frame, scale)]
+    }
+
+    #[test]
+    fn xft_dpi_and_workarea_visibility_handle_hidpi_and_multi_monitor_panels() {
+        assert_eq!(parse_xft_dpi("Xft.dpi:\t192\nXft.antialias:\t1\n"), Some(2.0));
+        assert_eq!(parse_xft_dpi("Xft.dpi: 96"), Some(1.0));
+        assert_eq!(parse_xft_dpi("Xft.antialias: 1"), None);
+
+        let primary = [0.0, 0.0, 1920.0, 1080.0];
+        let secondary = [1920.0, 0.0, 1920.0, 1080.0];
+        // Top bar of 32px and bottom Zorin panel of 48px on primary:
+        let workarea = Some([0.0, 32.0, 3840.0, 1000.0]);
+        assert_eq!(
+            compute_workarea_visible(primary, workarea, &[]),
+            [0.0, 32.0, 1920.0, 1000.0]
+        );
+        // Review Focus #3: broken/single-monitor _NET_WORKAREA that would clip secondary monitor to 0 width falls back to monitor frame.
+        let single_workarea = Some([0.0, 32.0, 1920.0, 1000.0]);
+        assert_eq!(
+            compute_workarea_visible(secondary, single_workarea, &[]),
+            secondary
+        );
+    }
+
+    #[test]
+    fn linux_coordinate_flip_is_identity() {
+        let r = [-1920.0, 37.0, 1920.0, 1080.0];
+        #[cfg(target_os = "linux")]
+        assert_eq!(flip(r, 1080.0), r);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let linux_flip = |r: Rect, _primary_h: f64| r;
+            assert_eq!(linux_flip(r, 1080.0), r);
+        }
     }
 
     #[test]

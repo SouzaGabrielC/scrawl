@@ -5,7 +5,7 @@
 //! evaluated in the recording's own pixels and then normalized to the capture, so the helper can
 //! draw it sharp through whatever the camera is doing. Times are on the video's clock.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::{InteractionEvent, LASER_MS, ScrawlBundle, Stroke};
 use crate::sketch::{FreehandOptions, freehand_outline, slice_laser_window, smooth_laser_points};
@@ -23,7 +23,7 @@ fn round(v: f32) -> f32 {
     (v * 1e5).round() / 1e5
 }
 
-#[derive(Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InkPlan {
     /// Source-pixel scale of ripples, lasers and pins (the keyframe renderer's `k`).
@@ -47,7 +47,7 @@ impl InkPlan {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InkStroke {
     /// The outline as drawn up to each moment, flat `x, y` pairs.
@@ -56,13 +56,13 @@ pub struct InkStroke {
     pub fade_ms: u64,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Snap {
     pub t: u64,
     pub poly: Vec<f32>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Pin {
     pub x: f32,
@@ -73,26 +73,26 @@ pub struct Pin {
     pub fade_ms: u64,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Laser {
     pub frames: Vec<LaserFrame>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct LaserFrame {
     pub t: u64,
     /// Flat `x, y, life` triples.
     pub pts: Vec<f32>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Ripple {
     pub x: f32,
     pub y: f32,
     pub t: u64,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Trail {
     /// Flat `x, y` pairs.
     pub pts: Vec<f32>,
@@ -316,6 +316,150 @@ fn laser(stroke: &Stroke, (w, h): (f32, f32), vt: impl Fn(u64) -> u64) -> Option
     Some(Laser { frames })
 }
 
+/// Renders active ink strokes (`#ff3b30`), click ripples, pins, and laser trails into `pixmap`
+/// at `t_ms` on the video clock, mapped through the current `camera` rect `[cx0, cy0, cx1, cy1]`.
+#[cfg(target_os = "linux")]
+pub fn render_frame_ink(
+    pixmap: &mut tiny_skia::PixmapMut<'_>,
+    plan: &InkPlan,
+    camera: [f32; 4],
+    t_ms: u64,
+) {
+    let width = pixmap.width() as f32;
+    let height = pixmap.height() as f32;
+    if width <= 0.0 || height <= 0.0 {
+        return;
+    }
+
+    let cw = (camera[2] - camera[0]).max(1e-5);
+    let ch = (camera[3] - camera[1]).max(1e-5);
+
+    let to_px = |x: f32, y: f32| -> (f32, f32) {
+        let cx = (x - camera[0]) / cw * width;
+        let cy = (y - camera[1]) / ch * height;
+        (cx, cy)
+    };
+
+    // 1. Active stroke outline polygons (#ff3b30)
+    for stroke in &plan.strokes {
+        let start_ms = stroke.snaps.first().map(|s| s.t).unwrap_or(0);
+        if t_ms < start_ms || t_ms >= stroke.fade_at + stroke.fade_ms {
+            continue;
+        }
+        let alpha = if t_ms <= stroke.fade_at {
+            1.0_f32
+        } else {
+            1.0 - (t_ms - stroke.fade_at) as f32 / stroke.fade_ms.max(1) as f32
+        };
+        let snap = match stroke.snaps.iter().filter(|s| s.t <= t_ms).last() {
+            Some(s) => s,
+            None => continue,
+        };
+        if snap.poly.len() >= 6 {
+            let mut pb = tiny_skia::PathBuilder::new();
+            let (x0, y0) = to_px(snap.poly[0], snap.poly[1]);
+            pb.move_to(x0, y0);
+            for chunk in snap.poly[2..].chunks_exact(2) {
+                let (px, py) = to_px(chunk[0], chunk[1]);
+                pb.line_to(px, py);
+            }
+            pb.close();
+            if let Some(path) = pb.finish() {
+                let mut paint = tiny_skia::Paint::default();
+                let a = (alpha * 255.0).clamp(0.0, 255.0) as u8;
+                paint.set_color_rgba8(255, 59, 48, a);
+                paint.anti_alias = true;
+                pixmap.fill_path(
+                    &path,
+                    &paint,
+                    tiny_skia::FillRule::Winding,
+                    tiny_skia::Transform::identity(),
+                    None,
+                );
+            }
+        }
+    }
+
+    // 2. Click ripples
+    for ripple in &plan.ripples {
+        if t_ms >= ripple.t && t_ms <= ripple.t + 550 {
+            let progress = (t_ms - ripple.t) as f32 / 550.0;
+            let (cx, cy) = to_px(ripple.x, ripple.y);
+            let radius = (4.0 + progress * 24.0) * plan.k.max(1.0);
+            let alpha = ((1.0 - progress) * 255.0).clamp(0.0, 255.0) as u8;
+
+            let mut pb = tiny_skia::PathBuilder::new();
+            pb.push_circle(cx, cy, radius);
+            if let Some(path) = pb.finish() {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color_rgba8(255, 59, 48, alpha);
+                paint.anti_alias = true;
+                let stroke = tiny_skia::Stroke {
+                    width: 2.5 * plan.k.max(1.0),
+                    ..Default::default()
+                };
+                pixmap.stroke_path(&path, &paint, &stroke, tiny_skia::Transform::identity(), None);
+            }
+        }
+    }
+
+    // 3. Pins
+    for pin in &plan.pins {
+        if t_ms >= pin.t && t_ms < pin.fade_at + pin.fade_ms {
+            let alpha = if t_ms <= pin.fade_at {
+                1.0_f32
+            } else {
+                1.0 - (t_ms - pin.fade_at) as f32 / pin.fade_ms.max(1) as f32
+            };
+            let (cx, cy) = to_px(pin.x, pin.y);
+            let radius = 12.0 * plan.pin_scale.max(0.75);
+            let mut pb = tiny_skia::PathBuilder::new();
+            pb.push_circle(cx, cy, radius);
+            if let Some(path) = pb.finish() {
+                let mut paint = tiny_skia::Paint::default();
+                let a = (alpha * 255.0).clamp(0.0, 255.0) as u8;
+                paint.set_color_rgba8(255, 59, 48, a);
+                paint.anti_alias = true;
+                pixmap.fill_path(
+                    &path,
+                    &paint,
+                    tiny_skia::FillRule::Winding,
+                    tiny_skia::Transform::identity(),
+                    None,
+                );
+            }
+        }
+    }
+
+    // 4. Lasers
+    for laser in &plan.lasers {
+        if let Some(frame) = laser.frames.iter().filter(|f| f.t <= t_ms).last() {
+            if t_ms <= frame.t + 300 {
+                for chunk in frame.pts.chunks_exact(3) {
+                    let (x, y, life) = (chunk[0], chunk[1], chunk[2]);
+                    let (cx, cy) = to_px(x, y);
+                    let radius = (3.0 + life * 5.0) * plan.k.max(1.0);
+                    let mut pb = tiny_skia::PathBuilder::new();
+                    pb.push_circle(cx, cy, radius);
+                    if let Some(path) = pb.finish() {
+                        let mut paint = tiny_skia::Paint::default();
+                        let a = (life * 255.0).clamp(0.0, 255.0) as u8;
+                        paint.set_color_rgba8(255, 59, 48, a);
+                        paint.anti_alias = true;
+                        pixmap.fill_path(
+                            &path,
+                            &paint,
+                            tiny_skia::FillRule::Winding,
+                            tiny_skia::Transform::identity(),
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,4 +658,26 @@ mod tests {
         assert_eq!(k, 1.0);
         assert!((size - 4.2).abs() < 1e-3);
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tiny_skia_ink_renderer_draws_visible_red_stroke_and_click_ripple_on_frame() {
+        let mut b = bundle();
+        b.strokes.push(stroke(200, &[(5000, 5000, 0), (6000, 5000, 100)]));
+        b.events.push(InteractionEvent::Click {
+            t: 250,
+            x: 0.25,
+            y: 0.25,
+            button: Some("left".into()),
+            label: None,
+            role: None,
+        });
+        let plan = plan(&b, (320, 180), Layers { ink: true, clicks: true });
+        let mut pixmap = tiny_skia::Pixmap::new(320, 180).unwrap();
+        render_frame_ink(&mut pixmap.as_mut(), &plan, [0.0, 0.0, 1.0, 1.0], 200);
+        // Midpoint of stroke at y=0.5 (row 90), x=0.55 (col 176) should have red ink:
+        let p = pixmap.pixel(176, 90).unwrap();
+        assert!(p.red() > 200 && p.alpha() > 200 && p.green() < 80);
+    }
 }
+
