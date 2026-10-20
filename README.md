@@ -6,6 +6,7 @@ Press a shortcut (`⌥⇧S`) and Scrawl starts recording the screen. Talk, click
 
 ## Install
 
+### macOS
 Scrawl needs an Apple silicon Mac on macOS 26 or later. Download the DMG from
 [scrawl.kitlangton.com](https://scrawl.kitlangton.com), or use Homebrew:
 
@@ -14,6 +15,9 @@ brew install --cask kitlangton/tap/scrawl
 ```
 
 The app updates itself (Sparkle), so Homebrew leaves updates to it.
+
+### Linux (Ubuntu / Zorin OS X11)
+For prerequisites, system dependencies, building from source, and running on Linux, see [docs/linux-build-and-run.md](docs/linux-build-and-run.md).
 
 ## Usage
 
