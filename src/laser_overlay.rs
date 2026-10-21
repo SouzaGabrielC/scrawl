@@ -700,6 +700,8 @@ use x11rb::connection::Connection;
 #[cfg(target_os = "linux")]
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 #[cfg(target_os = "linux")]
+use x11rb::wrapper::ConnectionExt as _;
+#[cfg(target_os = "linux")]
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 #[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::{
@@ -813,8 +815,8 @@ impl MetalLaserOverlay {
         // 1. Shape extension: set empty input shape (click-through)
         let _ = shape::ConnectionExt::shape_rectangles(
             &*conn,
-            shape::So::SET,
-            shape::Sk::INPUT,
+            shape::SO::SET,
+            shape::SK::INPUT,
             ClipOrdering::UNSORTED,
             window,
             0,
@@ -828,7 +830,7 @@ impl MetalLaserOverlay {
                 let _ = xfixes::ConnectionExt::xfixes_set_window_shape_region(
                     &*conn,
                     window,
-                    shape::Sk::INPUT,
+                    shape::SK::INPUT,
                     0,
                     0,
                     region,
@@ -1033,6 +1035,11 @@ struct XlibWindowSource {
 }
 
 #[cfg(target_os = "linux")]
+unsafe impl Send for XlibWindowSource {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for XlibWindowSource {}
+
+#[cfg(target_os = "linux")]
 impl raw_window_handle::HasWindowHandle for XlibWindowSource {
     fn window_handle(
         &self,
@@ -1108,8 +1115,7 @@ fn run_render_thread(
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         flags: wgpu::InstanceFlags::default(),
-        dx12_shader_compiler: Default::default(),
-        gles_minor_version: Default::default(),
+        backend_options: Default::default(),
     });
 
     let surface = match instance.create_surface(&source) {

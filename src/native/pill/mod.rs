@@ -477,6 +477,7 @@ struct PillViewIvars {
     action_tx: flume::Sender<PillAction>,
 }
 
+#[cfg(target_os = "macos")]
 define_class!(
     #[unsafe(super = NSView)]
     #[thread_kind = MainThreadOnly]
@@ -526,6 +527,7 @@ define_class!(
     }
 );
 
+#[cfg(target_os = "macos")]
 impl ScrawlPillView {
     fn new(mtm: MainThreadMarker, frame: NSRect, action_tx: flume::Sender<PillAction>) -> Retained<Self> {
         let this = mtm.alloc::<Self>().set_ivars(PillViewIvars { action_tx });
@@ -971,6 +973,7 @@ fn create_glass_views(root_view: &NSView, bounds: NSRect) -> Option<Retained<NSV
     }
 }
 
+#[cfg(target_os = "macos")]
 extern "C" fn pill_display_link_cb(
     _display_link: CVDisplayLinkRef,
     _now: *const CVTimeStamp,
@@ -998,6 +1001,7 @@ extern "C" fn pill_display_link_cb(
     0
 }
 
+#[cfg(target_os = "macos")]
 extern "C" fn pill_main_queue_trampoline(context: *mut c_void) {
     let shared = unsafe { Arc::from_raw(context.cast::<SharedNativePill>()) };
     if shared.alive.load(Ordering::Relaxed) {
@@ -1490,9 +1494,11 @@ use std::time::Duration;
 use x11rb::connection::Connection;
 #[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::{
-    AtomEnum, ClipOrdering, ColormapAlloc, ConfigureWindowAux, CreateWindowAux, EventMask,
-    PropMode, Rectangle, WindowClass,
+    AtomEnum, ClipOrdering, ColormapAlloc, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux,
+    EventMask, PropMode, Rectangle, WindowClass,
 };
+#[cfg(target_os = "linux")]
+use x11rb::wrapper::ConnectionExt as _;
 #[cfg(target_os = "linux")]
 use x11rb::protocol::shape;
 #[cfg(target_os = "linux")]
@@ -1525,6 +1531,11 @@ struct XlibWindowSource {
     display: *mut std::ffi::c_void,
     screen: i32,
 }
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for XlibWindowSource {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for XlibWindowSource {}
 
 #[cfg(target_os = "linux")]
 impl raw_window_handle::HasWindowHandle for XlibWindowSource {
@@ -2367,8 +2378,8 @@ impl NativePill {
         // Initial input shape: empty (click-through until hovered)
         let _ = shape::ConnectionExt::shape_rectangles(
             &*conn,
-            shape::So::SET,
-            shape::Sk::INPUT,
+            shape::SO::SET,
+            shape::SK::INPUT,
             ClipOrdering::UNSORTED,
             window,
             0,
@@ -2519,8 +2530,7 @@ fn run_linux_pill_thread(
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         flags: wgpu::InstanceFlags::default(),
-        dx12_shader_compiler: Default::default(),
-        gles_minor_version: Default::default(),
+        backend_options: Default::default(),
     });
 
     let surface = match instance.create_surface(&source) {
@@ -2765,8 +2775,8 @@ fn run_linux_pill_thread(
                 };
                 let _ = shape::ConnectionExt::shape_rectangles(
                     &*conn,
-                    shape::So::SET,
-                    shape::Sk::INPUT,
+                    shape::SO::SET,
+                    shape::SK::INPUT,
                     ClipOrdering::UNSORTED,
                     window,
                     0,
@@ -2776,8 +2786,8 @@ fn run_linux_pill_thread(
             } else {
                 let _ = shape::ConnectionExt::shape_rectangles(
                     &*conn,
-                    shape::So::SET,
-                    shape::Sk::INPUT,
+                    shape::SO::SET,
+                    shape::SK::INPUT,
                     ClipOrdering::UNSORTED,
                     window,
                     0,

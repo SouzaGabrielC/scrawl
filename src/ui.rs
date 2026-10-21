@@ -2653,6 +2653,7 @@ impl ScrawlCoordinator {
         if let Some(ref mut overlay) = self.picker_metal_overlay {
             overlay.move_to(frame);
         }
+        #[cfg(target_os = "macos")]
         if let Some(ns_win) = find_picker_ns_window() {
             move_window_to_screen(&ns_win, frame);
         }

@@ -2363,12 +2363,10 @@ mod tests {
     fn phone_session_start_fails_on_non_macos() {
         #[cfg(not(target_os = "macos"))]
         {
-            let res = PhoneSession::start(Path::new("dummy.mp4"), None, None);
-            assert!(res.is_err());
-            assert_eq!(
-                res.unwrap_err().to_string(),
-                "Cabled iPhone capture requires macOS"
-            );
+            let Err(err) = PhoneSession::start(Path::new("dummy.mp4"), None, None) else {
+                panic!("cabled iPhone capture must fail off macOS");
+            };
+            assert_eq!(err.to_string(), "Cabled iPhone capture requires macOS");
         }
     }
 }

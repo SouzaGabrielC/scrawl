@@ -7,6 +7,9 @@
 //! `scrawl.json`: they never go into `summary.md` or the clipboard.
 
 use std::collections::HashMap;
+
+#[cfg(target_os = "linux")]
+use x11rb::errors::ReplyError;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -308,7 +311,7 @@ pub fn frontmost_application() -> Option<FrontmostApp> {
         .ok()
         .and_then(|c| c.reply().ok());
     let pid = pid_prop
-        .and_then(|p| p.value32())
+        .and_then(|p| p.value32().map(|it| it.collect::<Vec<u32>>().into_iter()))
         .and_then(|mut it| it.next())
         .unwrap_or(0) as i32;
 
@@ -445,7 +448,7 @@ pub fn activate_app(pid: i32, bundle_id: Option<&str>) -> bool {
     if let Some(atom_s) = atom_stacking {
         if let Ok(prop) = conn
             .get_property(false, root, atom_s, AtomEnum::WINDOW, 0, 1024)
-            .and_then(|c| c.reply())
+            .map_err(ReplyError::from).and_then(|c| c.reply())
         {
             if let Some(w) = prop.value32() {
                 windows = w.collect();
@@ -456,7 +459,7 @@ pub fn activate_app(pid: i32, bundle_id: Option<&str>) -> bool {
         if let Some(atom_c) = atom_clients {
             if let Ok(prop) = conn
                 .get_property(false, root, atom_c, AtomEnum::WINDOW, 0, 1024)
-                .and_then(|c| c.reply())
+                .map_err(ReplyError::from).and_then(|c| c.reply())
             {
                 if let Some(w) = prop.value32() {
                     windows = w.collect();
@@ -473,7 +476,7 @@ pub fn activate_app(pid: i32, bundle_id: Option<&str>) -> bool {
         if pid > 0 && atom_pid.is_some() {
             if let Ok(prop) = conn
                 .get_property(false, win, atom_pid.unwrap(), AtomEnum::CARDINAL, 0, 1)
-                .and_then(|c| c.reply())
+                .map_err(ReplyError::from).and_then(|c| c.reply())
             {
                 if let Some(w_pid) = prop.value32().and_then(|mut it| it.next()) {
                     if w_pid as i32 == pid {
@@ -486,7 +489,7 @@ pub fn activate_app(pid: i32, bundle_id: Option<&str>) -> bool {
         if let Some(target_bundle) = bundle_id {
             if let Ok(prop) = conn
                 .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 1024)
-                .and_then(|c| c.reply())
+                .map_err(ReplyError::from).and_then(|c| c.reply())
             {
                 let s = String::from_utf8_lossy(&prop.value);
                 if s.split('\0').any(|c| c.eq_ignore_ascii_case(target_bundle)) {
@@ -698,7 +701,7 @@ pub fn raw_windows() -> Vec<RawWindow> {
     if let Some(atom_s) = atom_stacking {
         if let Ok(prop) = conn
             .get_property(false, root, atom_s, AtomEnum::WINDOW, 0, 1024)
-            .and_then(|c| c.reply())
+            .map_err(ReplyError::from).and_then(|c| c.reply())
         {
             if let Some(w) = prop.value32() {
                 windows = w.collect();
@@ -709,7 +712,7 @@ pub fn raw_windows() -> Vec<RawWindow> {
         if let Some(atom_c) = atom_clients {
             if let Ok(prop) = conn
                 .get_property(false, root, atom_c, AtomEnum::WINDOW, 0, 1024)
-                .and_then(|c| c.reply())
+                .map_err(ReplyError::from).and_then(|c| c.reply())
             {
                 if let Some(w) = prop.value32() {
                     windows = w.collect();
@@ -725,7 +728,7 @@ pub fn raw_windows() -> Vec<RawWindow> {
 
     for win in windows {
         // Skip unviewable windows
-        let Ok(attrs) = conn.get_window_attributes(win).and_then(|c| c.reply()) else {
+        let Ok(attrs) = conn.get_window_attributes(win).map_err(ReplyError::from).and_then(|c| c.reply()) else {
             continue;
         };
         if attrs.map_state != xproto::MapState::VIEWABLE {
@@ -736,7 +739,7 @@ pub fn raw_windows() -> Vec<RawWindow> {
         if let (Some(astate), Some(ahidden)) = (atom_state, atom_hidden) {
             if let Ok(prop) = conn
                 .get_property(false, win, astate, AtomEnum::ATOM, 0, 64)
-                .and_then(|c| c.reply())
+                .map_err(ReplyError::from).and_then(|c| c.reply())
             {
                 if let Some(states) = prop.value32() {
                     if states.into_iter().any(|s| s == ahidden) {
@@ -747,10 +750,10 @@ pub fn raw_windows() -> Vec<RawWindow> {
         }
 
         // Geometry in root window coordinates
-        let Ok(geom) = conn.get_geometry(win).and_then(|c| c.reply()) else {
+        let Ok(geom) = conn.get_geometry(win).map_err(ReplyError::from).and_then(|c| c.reply()) else {
             continue;
         };
-        let Ok(coords) = conn.translate_coordinates(win, root, 0, 0).and_then(|c| c.reply()) else {
+        let Ok(coords) = conn.translate_coordinates(win, root, 0, 0).map_err(ReplyError::from).and_then(|c| c.reply()) else {
             continue;
         };
 
@@ -792,7 +795,7 @@ pub fn raw_windows() -> Vec<RawWindow> {
         let mut owner = String::new();
         if let Ok(prop) = conn
             .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 1024)
-            .and_then(|c| c.reply())
+            .map_err(ReplyError::from).and_then(|c| c.reply())
         {
             let bytes = prop.value;
             let parts: Vec<&str> = std::str::from_utf8(&bytes)
@@ -816,7 +819,7 @@ pub fn raw_windows() -> Vec<RawWindow> {
         if let (Some(aname), Some(autf8)) = (atom_net_wm_name, atom_utf8) {
             if let Ok(prop) = conn
                 .get_property(false, win, aname, autf8, 0, 1024)
-                .and_then(|c| c.reply())
+                .map_err(ReplyError::from).and_then(|c| c.reply())
             {
                 if !prop.value.is_empty() {
                     title = String::from_utf8_lossy(&prop.value).to_string();
@@ -826,7 +829,7 @@ pub fn raw_windows() -> Vec<RawWindow> {
         if title.is_empty() {
             if let Ok(prop) = conn
                 .get_property(false, win, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 1024)
-                .and_then(|c| c.reply())
+                .map_err(ReplyError::from).and_then(|c| c.reply())
             {
                 if !prop.value.is_empty() {
                     title = String::from_utf8_lossy(&prop.value).to_string();
@@ -839,7 +842,7 @@ pub fn raw_windows() -> Vec<RawWindow> {
         if let Some(awtype) = atom_wtype {
             if let Ok(prop) = conn
                 .get_property(false, win, awtype, AtomEnum::ATOM, 0, 16)
-                .and_then(|c| c.reply())
+                .map_err(ReplyError::from).and_then(|c| c.reply())
             {
                 if let Some(types) = prop.value32() {
                     let ts: Vec<u32> = types.collect();

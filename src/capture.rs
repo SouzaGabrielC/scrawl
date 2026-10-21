@@ -20,6 +20,8 @@ use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 #[cfg(target_os = "linux")]
 use x11rb::connection::Connection as _;
 #[cfg(target_os = "linux")]
+use x11rb::errors::ReplyError;
+#[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::{
     self, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, GrabMode,
     ImageFormat, KeyButMask, ModMask, Window, WindowClass,
@@ -350,6 +352,10 @@ const KEY_ESCAPE: u16 = 53;
 const KEY_Z: u16 = 6;
 #[cfg(target_os = "macos")]
 const KEY_V: u16 = 9;
+#[cfg(target_os = "linux")]
+const KEY_S: u16 = 39;
+#[cfg(target_os = "linux")]
+const KEY_V: u16 = 55;
 
 // Carbon HIToolbox global hotkey constants (requires zero TCC permissions).
 pub const CARBON_CMD_KEY: u32 = 1 << 8;
@@ -1133,7 +1139,7 @@ fn run_x11_hotkey_listener(telemetry: Arc<SharedCaptureTelemetry>) {
     };
     let root = conn.setup().roots[screen_num].root;
 
-    let grab_shortcuts = |conn: &impl x11rb::connection::Connection,
+    let grab_shortcuts = |conn: &x11rb::rust_connection::RustConnection,
                           root: Window,
                           telemetry: &SharedCaptureTelemetry|
      -> (Option<(u8, u16)>, Option<(u8, u16)>) {
@@ -1187,7 +1193,7 @@ fn run_x11_hotkey_listener(telemetry: Arc<SharedCaptureTelemetry>) {
                 continue;
             }
             let kc = ev.detail;
-            let clean_mods = strip_x11_lock_mods(ev.state);
+            let clean_mods = strip_x11_lock_mods(ev.state.into());
             if let Some((rkc, rmods)) = record {
                 if kc == rkc && clean_mods == rmods {
                     telemetry.emit_capture_shortcut();
@@ -1468,7 +1474,7 @@ pub fn modifier_flags() -> u64 {
         return 0;
     };
     let root = conn.setup().roots[screen_num].root;
-    let Ok(reply) = conn.query_pointer(root).and_then(|c| c.reply()) else {
+    let Ok(reply) = conn.query_pointer(root).map_err(ReplyError::from).and_then(|c| c.reply()) else {
         return 0;
     };
     let mask = u16::from(reply.mask);
@@ -2163,6 +2169,7 @@ mod tests {
         assert!(restored.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_capture_shortcut_matches_its_aliases_and_a_custom_one() {
         let s = 1_u16; // the S key on this layout
@@ -4659,7 +4666,7 @@ fn run_linux_global_input_tap(telemetry: Arc<SharedCaptureTelemetry>) {
             }
         }
 
-        let Ok(reply) = conn.query_pointer(root).and_then(|c| c.reply()) else {
+        let Ok(reply) = conn.query_pointer(root).map_err(ReplyError::from).and_then(|c| c.reply()) else {
             continue;
         };
         let pmask = u16::from(reply.mask);

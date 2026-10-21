@@ -385,6 +385,7 @@ pub fn validate(
 
 // MARK: Launch at login (SMAppService, macOS 13+)
 
+#[cfg(target_os = "macos")]
 #[link(name = "ServiceManagement", kind = "framework")]
 unsafe extern "C" {}
 

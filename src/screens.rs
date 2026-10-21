@@ -11,6 +11,9 @@
 //! Capture pixels are a target's normalized coordinates (`SharedCaptureTelemetry::normalize_point`)
 //! times its recording's size (`capture::capture_size`, at most the display's own scale).
 //!
+#[cfg(target_os = "linux")]
+use x11rb::errors::ReplyError;
+
 use crate::model::TargetFrame;
 
 /// `[x, y, width, height]`.
@@ -333,7 +336,7 @@ pub fn displays() -> Vec<Screen> {
     let mut out = Vec::new();
 
     // Try RandR 1.5 get_monitors
-    if let Ok(reply) = randr::get_monitors(&conn, root, true).and_then(|c| c.reply()) {
+    if let Ok(reply) = randr::get_monitors(&conn, root, true).map_err(ReplyError::from).and_then(|c| c.reply()) {
         for (i, m) in reply.monitors.iter().enumerate() {
             if m.width > 0 && m.height > 0 {
                 let frame: Rect = [
@@ -355,9 +358,9 @@ pub fn displays() -> Vec<Screen> {
 
     // Fallback: CRTC resources
     if out.is_empty() {
-        if let Ok(res) = randr::get_screen_resources_current(&conn, root).and_then(|c| c.reply()) {
+        if let Ok(res) = randr::get_screen_resources_current(&conn, root).map_err(ReplyError::from).and_then(|c| c.reply()) {
             for (i, &crtc) in res.crtcs.iter().enumerate() {
-                if let Ok(ci) = randr::get_crtc_info(&conn, crtc, res.config_timestamp).and_then(|c| c.reply()) {
+                if let Ok(ci) = randr::get_crtc_info(&conn, crtc, res.config_timestamp).map_err(ReplyError::from).and_then(|c| c.reply()) {
                     if ci.width > 0 && ci.height > 0 {
                         let frame: Rect = [
                             ci.x as f64,
@@ -500,7 +503,7 @@ pub fn current() -> Vec<Screen> {
     if let Some(atom_c) = atom_clients {
         if let Ok(prop) = conn
             .get_property(false, root, atom_c, AtomEnum::WINDOW, 0, 1024)
-            .and_then(|c| c.reply())
+            .map_err(ReplyError::from).and_then(|c| c.reply())
         {
             if let Some(windows) = prop.value32() {
                 for win in windows {
@@ -508,7 +511,7 @@ pub fn current() -> Vec<Screen> {
                     if let Some(asp) = atom_strut_partial {
                         if let Ok(sp) = conn
                             .get_property(false, win, asp, AtomEnum::CARDINAL, 0, 12)
-                            .and_then(|c| c.reply())
+                            .map_err(ReplyError::from).and_then(|c| c.reply())
                         {
                             if let Some(vals) = sp.value32() {
                                 let v: Vec<u32> = vals.collect();
@@ -525,7 +528,7 @@ pub fn current() -> Vec<Screen> {
                         if let Some(as4) = atom_strut {
                             if let Ok(sp) = conn
                                 .get_property(false, win, as4, AtomEnum::CARDINAL, 0, 4)
-                                .and_then(|c| c.reply())
+                                .map_err(ReplyError::from).and_then(|c| c.reply())
                             {
                                 if let Some(vals) = sp.value32() {
                                     let v: Vec<u32> = vals.collect();
