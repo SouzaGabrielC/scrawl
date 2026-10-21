@@ -19,7 +19,9 @@ pub mod ink;
 
 #[cfg(target_os = "linux")]
 use std::io::Write;
-use std::io::{BufRead, BufReader, Read};
+#[cfg(target_os = "macos")]
+use std::io::{BufRead, BufReader};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -677,8 +679,12 @@ mod tests {
     #[test]
     fn default_output_lands_in_movies_scrawl() {
         let path = default_output(Path::new("/x/scrawl-17-9.scrawl"));
+        #[cfg(target_os = "linux")]
+        let folder = "Scrawl/scrawl-17-9.mp4";
+        #[cfg(not(target_os = "linux"))]
+        let folder = "Movies/Scrawl/scrawl-17-9.mp4";
         assert!(
-            path.ends_with("Movies/Scrawl/scrawl-17-9.mp4"),
+            path.ends_with(folder),
             "{}",
             path.display()
         );

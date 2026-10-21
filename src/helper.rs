@@ -4,15 +4,22 @@
 //! uses: SpeechAnalyzer transcription, CoreMediaIO/AVFoundation iPhone capture with a live
 //! mirror window, and AVFoundation movie decoding.
 
+#[cfg(target_os = "macos")]
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
-use crate::model::{RgbaFrame, TranscriptData, TranscriptSegment, WordTiming};
+#[cfg(target_os = "macos")]
+use crate::model::{TranscriptSegment, WordTiming};
+use crate::model::{RgbaFrame, TranscriptData};
 
 #[cfg(target_os = "macos")]
 pub fn path() -> Result<PathBuf> {
@@ -410,6 +417,7 @@ pub fn qr(text: &str) -> Result<String> {
 // MARK: Linux ffmpeg / ffprobe implementations
 
 #[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn permissions()
 -> Result<std::collections::BTreeMap<crate::onboarding::Permission, crate::onboarding::Status>> {
     use crate::onboarding::{Permission, Status};
@@ -427,6 +435,7 @@ pub fn devices() -> Result<Vec<PhoneDevice>> {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn transcribe(_audio: &Path) -> Result<TranscriptData> {
     bail!("Apple SpeechAnalyzer is not available on Linux; use Hex or Parakeet")
 }

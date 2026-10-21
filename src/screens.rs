@@ -640,6 +640,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn appkit_and_global_rects_flip_against_the_primary_height() {
         // A 1920×1080 display left of the laptop, bottoms aligned: AppKit y 0, global y 37.

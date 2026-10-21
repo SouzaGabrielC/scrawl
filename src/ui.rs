@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -454,6 +455,7 @@ enum MenuAction {
     ToggleCapture,
     ChooseTarget,
     OpenLatest,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     OpenInbox(PathBuf),
     ExportVideo,
     Settings,
@@ -3693,7 +3695,9 @@ impl Render for HudPillWindow {
         };
         let phase_age = motion::age(coord.island_phase_since);
         let width = coord.island_width;
+        #[cfg(target_os = "macos")]
         let scale = coord.island_scale;
+        #[cfg(target_os = "macos")]
         let y_off = coord.island_y;
         let opacity = coord.island_opacity.clamp(0.0, 1.0);
         let recording_ms = coord
@@ -3791,6 +3795,7 @@ impl Render for HudPillWindow {
             && switch_layout.is_none();
         // Reduce motion keeps the cross-fade and drops the blur.
         let swap_blur = if reduced { 0.0 } else { 3.5 };
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
         let (content_phase, blur_radius, content_alpha) =
             if matches!(phase, IslandPhase::Dismissing) {
                 (
@@ -3826,6 +3831,7 @@ impl Render for HudPillWindow {
                 (target_phase, 0.0, 1.0)
             };
         // The swap's blur leaves the content's scale alone so the pinned lead stays put.
+        #[cfg(target_os = "macos")]
         let content_shrink = if swap.is_some() { 0.0 } else { 0.015 };
         let is_completed = matches!(target_phase, IslandPhase::Completed { .. });
 
@@ -5803,6 +5809,8 @@ fn ensure_hud_pill_open(coord_entity: &Entity<ScrawlCoordinator>, cx: &mut App) 
     for handle in cx.windows() {
         if let Some(pill) = handle.downcast::<HudPillWindow>() {
             let _ = pill.update(cx, |view, _, cx| {
+                #[cfg(not(target_os = "macos"))]
+                let _ = view;
                 #[cfg(target_os = "macos")]
                 if let Some(ref ns_win) = view.ns_window {
                     ns_win.setLevel(NSStatusWindowLevel + 3);

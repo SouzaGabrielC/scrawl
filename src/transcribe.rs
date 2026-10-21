@@ -141,6 +141,7 @@ pub fn set_override(engine: Engine) {
 
 /// Missing microphones and a failed transcriber never prevent saving a bundle.
 pub fn transcribe(wav: Option<&Path>, audio: Option<&RecordedAudio>) -> TranscriptData {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     let (Some(wav), Some(audio)) = (wav, audio.filter(|audio| audio.sample_count > 0)) else {
         return TranscriptData {
             source: "none".into(),
@@ -273,6 +274,7 @@ fn try_hex(audio: &RecordedAudio) -> Result<Option<TranscriptData>> {
     crate::hex::transcribe_audio(&client, &model, audio).map(Some)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn apple(wav: &Path) -> TranscriptData {
     crate::helper::transcribe(wav).unwrap_or_else(|error| {
         crate::capture::scrawl_log(format!("SpeechAnalyzer failed: {error:#}"));

@@ -23,17 +23,16 @@ use x11rb::connection::Connection as _;
 use x11rb::errors::ReplyError;
 #[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::{
-    self, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, GrabMode,
-    ImageFormat, KeyButMask, ModMask, Window, WindowClass,
+    self, ConnectionExt as _, GrabMode, ImageFormat, Window,
 };
 #[cfg(target_os = "linux")]
-use x11rb::protocol::xfixes::{self, ConnectionExt as _};
+use x11rb::protocol::xfixes::ConnectionExt as _;
 #[cfg(target_os = "linux")]
 use x11rb::protocol::shm::{self, ConnectionExt as _};
 #[cfg(target_os = "linux")]
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 #[cfg(target_os = "linux")]
-use x11rb::protocol::xtest::{self, ConnectionExt as _};
+use x11rb::protocol::xtest::ConnectionExt as _;
 
 use crate::model::{
     CaptureMode, InteractionEvent, RgbaFrame, SCALE, Stroke, TargetFrame, TargetInfo,
@@ -149,16 +148,19 @@ pub fn strip_x11_lock_mods(state: u16) -> u16 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct X11Shortcut {
     pub keysym: u32,
     pub mods: u16,
 }
 
 impl X11Shortcut {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn new(keysym: u32, mods: u16) -> Self {
         Self { keysym, mods }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn from_label(label: &str) -> Option<Self> {
         let (keysym, carbon_mods) = parse_x11_shortcut(label)?;
         Some(Self {
@@ -168,6 +170,7 @@ impl X11Shortcut {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn parse_x11_shortcut_spec(spec: &str) -> Option<X11Shortcut> {
     X11Shortcut::from_label(spec)
 }
@@ -189,6 +192,7 @@ pub fn carbon_modifiers_to_x11_mods(carbon_mods: u32) -> u16 {
     x11
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn x11_mods_to_carbon_modifiers(x11_mods: u16) -> u32 {
     let mut carbon = 0_u32;
     if x11_mods & (1 << 0) != 0 {
@@ -282,6 +286,7 @@ impl CursorHideGuard {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn noop() -> Self {
         Self {
             hidden: false,
@@ -289,10 +294,12 @@ impl CursorHideGuard {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn is_hidden(&self) -> bool {
         self.hidden
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn disarm(&mut self) {
         self.hidden = false;
         self.restore_fn = None;
@@ -534,6 +541,7 @@ pub enum LiveOverlayEvent {
     CaptureShortcut,
     PasteLatestShortcut,
     UndoStroke,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     CancelCapture,
     RequestSnapshot,
     /// The iPhone mirror ended on its own (unplugged, never found, or access denied).
@@ -646,6 +654,7 @@ pub fn layout_v_keycode() -> u16 {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn init_keyboard_layout_map() -> &'static std::collections::HashMap<char, u16> {
     static MAP: std::sync::OnceLock<std::collections::HashMap<char, u16>> =
         std::sync::OnceLock::new();
@@ -1155,7 +1164,7 @@ fn run_x11_hotkey_listener(telemetry: Arc<SharedCaptureTelemetry>) {
                 let _ = conn.grab_key(
                     true,
                     root,
-                    mask,
+                    xproto::ModMask::from(mask),
                     kc,
                     GrabMode::ASYNC,
                     GrabMode::ASYNC,
@@ -2667,6 +2676,7 @@ pub fn ensure_external_app_active() {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn frontmost_external_pid() -> Option<i32> {
     let our_pid = std::process::id() as i32;
     if let Some(app) = crate::windows::frontmost_application() {
@@ -3413,12 +3423,16 @@ pub struct SharedCaptureTelemetry {
     /// a click landed on Scrawl itself.
     pub passthrough_window_ids: Mutex<Vec<u32>>,
     /// The key event tap (`CFMachPortRef`), made once Accessibility is on (`check_key_tap`).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     tap_port: AtomicU64,
     /// The key event tap thread's run loop (retained), so `check_key_tap` can stop it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     tap_run_loop: AtomicU64,
     /// A key tap thread is being started.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     tap_starting: AtomicBool,
     /// When the last key tap was tried (ms since `UNIX_EPOCH`), to space out retries.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     tap_tried_ms: AtomicU64,
     /// Whether the key tap is delivering; logged when it changes.
     tap_live: AtomicBool,
@@ -3783,6 +3797,7 @@ impl SharedCaptureTelemetry {
     }
 
     #[cfg(not(target_os = "macos"))]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn check_key_tap(self: &Arc<Self>) -> bool {
         false
     }
@@ -4367,6 +4382,7 @@ pub fn post_synthetic_cmd_v() {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn post_synthetic_cmd_v() {
     post_synthetic_paste(false);
 }

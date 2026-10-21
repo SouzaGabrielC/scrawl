@@ -698,11 +698,11 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use x11rb::connection::Connection;
 #[cfg(target_os = "linux")]
-use x11rb::protocol::shape::{self, ConnectionExt as _};
+use x11rb::protocol::shape;
 #[cfg(target_os = "linux")]
 use x11rb::wrapper::ConnectionExt as _;
 #[cfg(target_os = "linux")]
-use x11rb::protocol::xfixes::{self, ConnectionExt as _};
+use x11rb::protocol::xfixes;
 #[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::{
     AtomEnum, ClipOrdering, ColormapAlloc, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux,
@@ -946,6 +946,7 @@ impl MetalLaserOverlay {
         })
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn spawn(telemetry: Arc<SharedCaptureTelemetry>) -> Option<Self> {
         Self::open(telemetry, None).ok()
     }
@@ -954,6 +955,7 @@ impl MetalLaserOverlay {
         self.window
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn window_id(&self) -> u32 {
         self.window
     }

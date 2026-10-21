@@ -175,6 +175,7 @@ pub fn browser_kind(bundle_id: &str) -> Option<Browser> {
     None
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn safe_bundle_id(id: &str) -> bool {
     !id.is_empty()
         && id

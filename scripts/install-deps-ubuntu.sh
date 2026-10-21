@@ -18,6 +18,7 @@ $SUDO apt-get install -y \
   libasound2-dev \
   libgtk-3-dev \
   libayatana-appindicator3-dev \
+  libxdo-dev \
   libvulkan-dev \
   vulkan-tools \
   ffmpeg \

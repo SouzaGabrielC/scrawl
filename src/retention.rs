@@ -18,7 +18,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, ensure};
+#[cfg(target_os = "macos")]
+use anyhow::ensure;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::capture::scrawl_log;

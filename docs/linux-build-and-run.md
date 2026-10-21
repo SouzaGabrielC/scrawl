@@ -57,6 +57,7 @@ sudo apt-get update && sudo apt-get install -y \
   libasound2-dev \
   libgtk-3-dev \
   libayatana-appindicator3-dev \
+  libxdo-dev \
   libvulkan-dev \
   vulkan-tools \
   ffmpeg
@@ -66,7 +67,7 @@ sudo apt-get update && sudo apt-get install -y \
 - **`libx11-dev`, `libxcb1-dev`, `libxrandr-dev`, `libxi-dev`, `libxtst-dev`, `libxfixes-dev`**: X11 screen capture (`XShm`), global hotkeys, input tap, display geometries, and click-through red ink overlay.
 - **`libasound2-dev`**: ALSA audio headers used by `cpal` for microphone recording.
 - **`libvulkan-dev`, `vulkan-tools`**: Vulkan graphics drivers for `wgpu` rendering (floating HUD pill and laser overlay).
-- **`libgtk-3-dev`, `libayatana-appindicator3-dev`**: StatusNotifierItem / AppIndicator support for the system tray menu (`tray-icon` + `muda`).
+- **`libgtk-3-dev`, `libayatana-appindicator3-dev`, `libxdo-dev`**: StatusNotifierItem / AppIndicator support for the system tray menu (`tray-icon` + `muda`); `libxdo-dev` provides `-lxdo` for linking `muda`.
 - **`ffmpeg`**: Subprocess helper for encoding video and processing audio.
 
 ---

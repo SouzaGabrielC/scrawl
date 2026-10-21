@@ -8,8 +8,12 @@ pub mod model;
 
 use std::mem::size_of;
 
-use self::atlas::{GlyphAtlas, IconKind};
-use self::model::{CHIP_H, CHIP_PX, ElemId, FrameState, PANEL_H, PANEL_W, PillModel, Pres};
+#[cfg(target_os = "macos")]
+use self::atlas::GlyphAtlas;
+use self::atlas::IconKind;
+#[cfg(target_os = "macos")]
+use self::model::FrameState;
+use self::model::{CHIP_H, CHIP_PX, ElemId, PANEL_H, PANEL_W, PillModel, Pres};
 #[cfg(target_os = "linux")]
 use self::model::{CX, TOP};
 use crate::ui::{SelectionMode, motion};
@@ -1626,8 +1630,10 @@ struct WgpuPipelines {
     blur_boxes_buf: wgpu::Buffer,
     pill_uniforms_buf: wgpu::Buffer,
     comp_elems_buf: wgpu::Buffer,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     offscreen_a: wgpu::Texture,
     offscreen_a_view: wgpu::TextureView,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     offscreen_b: wgpu::Texture,
     offscreen_b_view: wgpu::TextureView,
     linear_sampler: wgpu::Sampler,
@@ -2476,6 +2482,7 @@ impl NativePill {
         self.action_rx.try_iter().collect()
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn try_recv_action(&self) -> Option<PillAction> {
         self.action_rx.try_recv().ok()
     }

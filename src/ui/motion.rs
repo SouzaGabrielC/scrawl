@@ -662,6 +662,7 @@ fn visible(rect: [f32; 4], clip: [f32; 4]) -> Option<[f32; 4]> {
 }
 
 /// A scalar per frame: `kind` is motion-lint's `level`, `phase` or `position`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn trace_channel(name: &'static str, kind: &'static str, value: f32) {
     TRACE.with_borrow_mut(|slot| {
         if let Some(pending) = slot.as_mut().and_then(|t| t.pending.as_mut()) {

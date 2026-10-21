@@ -3,6 +3,7 @@
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum UpdateStatus {
     Unavailable = 0,
     Idle = 1,

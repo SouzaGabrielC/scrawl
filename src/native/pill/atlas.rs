@@ -520,7 +520,7 @@ impl GlyphAtlas {
 use std::sync::{Arc, OnceLock};
 
 #[cfg(target_os = "linux")]
-use ab_glyph::{Font, Glyph, PxScale, ScaleFont};
+use ab_glyph::{Font, PxScale, ScaleFont};
 #[cfg(target_os = "linux")]
 use tiny_skia::{LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
@@ -744,7 +744,7 @@ pub fn rasterize_icon_rgba(kind: IconKind, size_pt: f32, scale: f32) -> (u32, u3
 
     match kind {
         IconKind::Area => {
-            let mut corner = |pb: &mut PathBuilder, ax: f32, ay: f32, cx: f32, cy: f32, bx: f32, by: f32| {
+            let corner = |pb: &mut PathBuilder, ax: f32, ay: f32, cx: f32, cy: f32, bx: f32, by: f32| {
                 pb.move_to(ax * s, ay * s);
                 pb.line_to(cx * s, cy * s);
                 pb.line_to(bx * s, by * s);
