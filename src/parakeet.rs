@@ -110,7 +110,7 @@ pub fn ensure_parakeet_model(progress: &mut dyn FnMut(u64, u64)) -> Result<PathB
             downloaded_bytes += n as u64;
             progress(downloaded_bytes, total_bytes);
         }
-        file.flush()?;
+        std::io::Write::flush(&mut file)?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&part_path, &dest_path)?;
@@ -450,11 +450,14 @@ fn get_or_init_runtime() -> Result<&'static Mutex<Option<ParakeetRuntime>>> {
         let decoder_path = dir.join(MODEL_FILES[1]);
         let vocab_path = dir.join(MODEL_FILES[2]);
 
-        let encoder = Session::builder()?
-            .with_intra_threads(4)?
+        let env = ort::init().build()?;
+        let encoder = Session::builder(&env)?
+            .with_intra_threads(4)
+            .map_err(ort::Error::<()>::from)?
             .commit_from_file(&encoder_path)?;
-        let decoder_joint = Session::builder()?
-            .with_intra_threads(4)?
+        let decoder_joint = Session::builder(&env)?
+            .with_intra_threads(4)
+            .map_err(ort::Error::<()>::from)?
             .commit_from_file(&decoder_path)?;
 
         let vocab_content = std::fs::read_to_string(&vocab_path)?;

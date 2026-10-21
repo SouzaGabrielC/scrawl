@@ -230,29 +230,19 @@ pub fn parse_x11_shortcut(label: &str) -> Option<(u32, u32)> {
         }
         key_str = parts[parts.len() - 1];
     } else {
-        let mut chars = label.chars().peekable();
-        while let Some(&ch) = chars.peek() {
-            match ch {
-                '⌥' => {
-                    mods |= CARBON_OPTION_KEY;
-                    chars.next();
-                }
-                '⇧' => {
-                    mods |= CARBON_SHIFT_KEY;
-                    chars.next();
-                }
-                '⌃' => {
-                    mods |= CARBON_CONTROL_KEY;
-                    chars.next();
-                }
-                '⌘' => {
-                    mods |= CARBON_CMD_KEY;
-                    chars.next();
-                }
+        let mut rest = label;
+        loop {
+            let mut chars = rest.chars();
+            match chars.next() {
+                Some('⌥') => mods |= CARBON_OPTION_KEY,
+                Some('⇧') => mods |= CARBON_SHIFT_KEY,
+                Some('⌃') => mods |= CARBON_CONTROL_KEY,
+                Some('⌘') => mods |= CARBON_CMD_KEY,
                 _ => break,
             }
+            rest = chars.as_str();
         }
-        key_str = chars.as_str().trim();
+        key_str = rest.trim();
     }
 
     if key_str.is_empty() {

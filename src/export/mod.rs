@@ -17,7 +17,9 @@ pub mod camera;
 pub mod crop;
 pub mod ink;
 
-use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(target_os = "linux")]
+use std::io::Write;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 

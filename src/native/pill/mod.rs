@@ -8,10 +8,10 @@ pub mod model;
 
 use std::mem::size_of;
 
-use self::atlas::IconKind;
-use self::model::{
-    CHIP_H, CHIP_PX, CX, ElemId, FrameState, PANEL_H, PANEL_W, PillModel, Pres, TOP,
-};
+use self::atlas::{GlyphAtlas, IconKind};
+use self::model::{CHIP_H, CHIP_PX, ElemId, FrameState, PANEL_H, PANEL_W, PillModel, Pres};
+#[cfg(target_os = "linux")]
+use self::model::{CX, TOP};
 use crate::ui::{SelectionMode, motion};
 
 const OFFSCREEN_W_PT: f32 = 960.0;
